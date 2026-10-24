@@ -1,0 +1,15 @@
+[Unit]
+Description=Vitals dropdown panel (starts hidden)
+PartOf=graphical-session.target
+Requires=vitalsd.service
+After=vitalsd.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vitals-panel
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

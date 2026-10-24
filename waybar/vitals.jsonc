@@ -1,0 +1,18 @@
+// Merge this module section into ~/.config/waybar/config.jsonc
+// and add "custom/vitals-battery" to your modules-right list.
+//
+// NOTE (this machine's waybar 0.15): do NOT set "interval" — the bridge
+// streams JSON lines continuously (one object per line).
+{
+  "custom/vitals-battery": {
+    "exec": "~/.local/bin/vitals-bar battery",
+    "return-type": "json",
+    "restart-interval": 3,
+    "exec-on-event": false,
+    "on-click": "~/.local/bin/vitalsctl panel toggle battery",
+    "on-click-right": "~/.local/bin/vitalsctl profile cycle",
+    "on-scroll-up": "~/.local/bin/vitalsctl brightness +5",
+    "on-scroll-down": "~/.local/bin/vitalsctl brightness -5",
+    "tooltip": true
+  }
+}

@@ -1,0 +1,33 @@
+/* Vitals waybar module styles — append to ~/.config/waybar/style.css
+   (GTK3 CSS engine: no :not() support). */
+
+#custom-vitals-battery {
+    padding: 0 6px;
+}
+
+#custom-vitals-battery.charging,
+#custom-vitals-battery.full {
+    color: #b8bb26; /* green */
+}
+
+#custom-vitals-battery.held {
+    color: #83a598; /* blue-ish */
+}
+
+#custom-vitals-battery.low,
+#custom-vitals-battery.warning {
+    color: #f9a825; /* amber */
+}
+
+#custom-vitals-battery.critical {
+    color: #e53935; /* red */
+    animation: vitals-blink 1s linear infinite;
+}
+
+#custom-vitals-battery.unknown {
+    color: #928374;
+}
+
+@keyframes vitals-blink {
+    50% { opacity: 0.35; }
+}
