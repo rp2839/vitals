@@ -3,7 +3,7 @@
 A single layer-shell surface anchored top-right. It is a thin client: all
 data comes from vitalsd over the JSON socket protocol; controls write
 through the daemon. Visibility is driven by `panel` events (toggled by
-`vitalsctl panel toggle battery` from the waybar module).
+`vitalsctl panel toggle` from the waybar module).
 """
 from __future__ import annotations
 

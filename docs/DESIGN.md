@@ -22,7 +22,7 @@ sysfs / inotify / system D-Bus / brightnessctl
                  Waybar     GTK3 layer-shell
 ```
 
-The daemon runs as a systemd user service. The panel runs as a separate, single-instance user service, initially hidden. This isolates GTK failures and keeps GTK dependencies out of the daemon. The panel subscribes to panel-visibility events; `vitalsctl panel toggle battery` sends a request to the daemon, which notifies the panel.
+The daemon runs as a systemd user service. The panel runs as a separate, single-instance user service, initially hidden. This isolates GTK failures and keeps GTK dependencies out of the daemon. The panel subscribes to panel-visibility events; `vitalsctl panel toggle` sends a request to the daemon, which notifies the panel.
 
 On reconnect, the panel receives the current visibility state. Disconnecting from the daemon hides the panel and disables controls until reconnection.
 
@@ -441,7 +441,7 @@ Merge this module into the existing configuration and add `custom/vitals-battery
     "return-type": "json",
     "restart-interval": 3,
     "exec-on-event": false,
-    "on-click": "$HOME/.local/bin/vitalsctl panel toggle battery",
+    "on-click": "$HOME/.local/bin/vitalsctl panel toggle",
     "tooltip": true,
     "escape": true
   }
