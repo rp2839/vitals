@@ -9,8 +9,19 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCK="$XDG_RUNTIME_DIR/vitals/control.sock"
 
 python3 bin/vitalsd >/tmp/vitals-smoke.log 2>&1 & DPID=$!
-for i in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
-[ -S "$SOCK" ] || fail "daemon did not create $SOCK"
+for i in $(seq 1 40); do
+  if timeout 2 python3 - <<'EOF' 2>/dev/null
+import os, socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(1)
+try:
+    s.connect(os.environ["XDG_RUNTIME_DIR"] + "/vitals/control.sock")
+except OSError:
+    sys.exit(1)
+EOF
+  then break; fi
+  sleep 0.25
+done
+kill -0 $DPID 2>/dev/null || { cat /tmp/vitals-smoke.log; fail "daemon exited early"; }
 
 timeout 10 ./bin/vitalsctl status            || fail "vitalsctl status"
 timeout 10 ./bin/vitalsctl brightness get    || fail "brightness get"
