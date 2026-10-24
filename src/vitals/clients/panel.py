@@ -15,6 +15,7 @@ import time
 
 import gi
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 gi.require_version("GtkLayerShell", "0.1")
 from gi.repository import Gdk, GLib, Gtk, GtkLayerShell, Pango  # noqa: E402
 
@@ -234,6 +235,7 @@ class Panel:
         self.win.get_style_context().add_class("vitals-panel")
         self.win.set_default_size(self.width, -1)
         GtkLayerShell.init_for_window(self.win)
+        GtkLayerShell.set_namespace(self.win, "vitals-panel")
         GtkLayerShell.set_layer(self.win, GtkLayerShell.Layer.TOP)
         GtkLayerShell.set_anchor(self.win, GtkLayerShell.Edge.TOP, True)
         GtkLayerShell.set_anchor(self.win, GtkLayerShell.Edge.RIGHT, True)
@@ -243,9 +245,13 @@ class Panel:
                                  int(pcfg.get("margin_right", 8)))
         GtkLayerShell.set_keyboard_mode(
             self.win, GtkLayerShell.KeyboardMode.ON_DEMAND)
-        GtkLayerShell.set_autohide(self.win, True)
         self.win.connect("key-press-event", self.on_key)
         self.win.connect("delete-event", lambda *a: True)
+        # close on focus-out once the user has actually interacted (DESIGN §1);
+        # this gtk-layer-shell build has no set_autohide binding
+        self._had_focus = False
+        self.win.connect("focus-in-event", self._on_focus_in)
+        self.win.connect("focus-out-event", self._on_focus_out)
 
         self._build_ui()
         self._load_css()
@@ -367,6 +373,7 @@ class Panel:
         # -- brightness slider
         br_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         br_box.get_style_context().add_class("section")
+        self.br_box = br_box
         sun = Gtk.Label(label="☀")
         sun.get_style_context().add_class("dim")
         br_box.pack_start(sun, False, False, 0)
@@ -424,6 +431,8 @@ class Panel:
         self._fetch_history()
 
     def on_daemon_lost(self) -> None:
+        self.win.hide()
+        self.visible = False
         self.lbl_state.set_text("daemon offline")
 
     def on_msg(self, msg: dict) -> None:
@@ -433,6 +442,11 @@ class Panel:
                 self.show()
             else:
                 self.hide()
+            return
+        if msg.get("ok") and isinstance(msg.get("panel"), dict):
+            # subscribe ack carries current daemon-side visibility
+            if msg["panel"].get("visible"):
+                self.show()
             return
         data = msg.get("data")
         if not data:
@@ -487,6 +501,13 @@ class Panel:
             self.t_remaining.set_text(fmt_time(b.get("time_to_full_s")) or "estimating…")
         else:
             self.t_remaining.set_text("—" if state != "full" else "Full")
+        on_s = b.get("on_source_s")
+        if on_s is not None:
+            label = "Time on battery" if not b.get("ac_online") else "Time on AC"
+            self.grid_times[0].get_child_at(0, 1).set_text(label)
+            self.t_on_since.set_text(fmt_time(on_s) or "—")
+        avg = b.get("avg_power_10m_w")
+        self.t_avg.set_text(f"{avg:.1f} W" if avg is not None else "—")
 
         # health
         health = b.get("health_percent")
@@ -536,7 +557,7 @@ class Panel:
 
         # brightness
         bp = p.get("brightness_percent")
-        self.scale.set_visible(bool(p.get("brightness_available")))
+        self.br_box.set_visible(bool(p.get("brightness_available")))
         if bp is not None and not self._brightness_drag:
             self._setting = True
             self.scale.set_value(bp)
@@ -598,14 +619,28 @@ class Panel:
         self.win.present()
         self._fetch_history()
 
-    def hide(self) -> None:
+    def hide(self, notify_daemon: bool = True) -> None:
+        was = self.visible
         self.visible = False
+        self._had_focus = False
         self.win.hide()
+        if was and notify_daemon:
+            # keep daemon-side visibility in sync (single-click reopen)
+            self.dc.send({"v": 1, "id": "v1", "op": "panel.set",
+                          "panel": "battery", "visible": False})
 
     def on_key(self, _w, event) -> bool:
         if event.keyval == Gdk.KEY_Escape:
             self.hide()
             return True
+        return False
+
+    def _on_focus_in(self, *_a):
+        self._had_focus = True
+
+    def _on_focus_out(self, *_a):
+        if self.visible and self._had_focus:
+            self.hide()
         return False
 
 

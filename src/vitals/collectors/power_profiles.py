@@ -36,6 +36,19 @@ def _profile_names(prof) -> list[str]:
     return out
 
 
+def _first_holder(holds) -> Optional[str]:
+    """ActiveProfileHolds is aa{sv}: list of dicts with ApplicationId."""
+    try:
+        for entry in holds or []:
+            if isinstance(entry, dict):
+                app = entry.get("ApplicationId")
+                if app:
+                    return str(app)
+    except Exception:
+        pass
+    return None
+
+
 class PowerProfiles:
     def __init__(self, on_change: Callable[[], None] | None = None):
         self.on_change = on_change
@@ -53,25 +66,31 @@ class PowerProfiles:
             self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         except GLib.Error:
             return
+        # watch name (dis)appearance first: discovery may succeed later
+        self._name_sub = self.bus.signal_subscribe(
+            DBUS, "org.freedesktop.DBus", "NameOwnerChanged",
+            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE,
+            self._on_name_owner)
+        self._discover()
+
+    def _discover(self) -> bool:
         for name, path, iface in BUS_NAMES:
             try:
                 prof = self._props_get(name, path, iface, "Profiles")
                 self.bus_name, self.path, self.iface = name, path, iface
                 self.profiles = _profile_names(prof)
                 self.available = True
-                break
+                self._refresh()
+                if self._sub_id is None:
+                    self._sub_id = self.bus.signal_subscribe(
+                        self.bus_name, DBUS_PROPS, "PropertiesChanged",
+                        self.path, None, Gio.DBusSignalFlags.NONE,
+                        self._on_props)
+                return True
             except GLib.Error:
                 continue
-        if not self.available:
-            return
-        self._refresh()
-        self._sub_id = self.bus.signal_subscribe(
-            self.bus_name, DBUS_PROPS, "PropertiesChanged", self.path, None,
-            Gio.DBusSignalFlags.NONE, self._on_props)
-        self._name_sub = self.bus.signal_subscribe(
-            DBUS, "org.freedesktop.DBus", "NameOwnerChanged",
-            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE,
-            self._on_name_owner)
+        self.available = False
+        return False
 
     def _props_get(self, bus_name, path, iface, prop):
         res = self.bus.call_sync(
@@ -88,8 +107,8 @@ class PowerProfiles:
             self.profiles = _profile_names(prof)
             try:
                 hold = self._props_get(self.bus_name, self.path, self.iface,
-                                       "ActiveProfileHold")
-                self.hold = hold or None
+                                       "ActiveProfileHolds")
+                self.hold = _first_holder(hold)
             except GLib.Error:
                 self.hold = None
         except GLib.Error:
@@ -106,10 +125,14 @@ class PowerProfiles:
 
     def _on_name_owner(self, conn, sender, path, iface, sig, params) -> None:
         name, old, new = params.unpack()
-        if name == self.bus_name:
-            self.available = bool(new)
-            if new:
-                self._refresh()
+        if name not in [n for n, _, _ in BUS_NAMES]:
+            return
+        if new:
+            if self._discover():
+                if self.on_change:
+                    self.on_change()
+        elif name == self.bus_name:
+            self.available = False
             if self.on_change:
                 self.on_change()
 
@@ -121,7 +144,7 @@ class PowerProfiles:
         try:
             self.bus.call_sync(
                 self.bus_name, self.path, DBUS_PROPS, "Set",
-                GLib.Variant("(svv)", (self.iface, "ActiveProfile",
+                GLib.Variant("(ssv)", (self.iface, "ActiveProfile",
                                        GLib.Variant("s", profile))),
                 None, Gio.DBusCallFlags.NONE, 3000, None)
         except GLib.Error as e:

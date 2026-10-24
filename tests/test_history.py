@@ -44,6 +44,18 @@ class HistoryTests(unittest.TestCase):
         vals = [v for _, v in s["percent"]]
         self.assertIn(None, vals)
 
+    def test_downsample_preserves_gaps(self):
+        # buckets with no samples must emit nulls so graphs never bridge gaps
+        h = History()
+        now = time.time()
+        for i in range(30):
+            h.append(now - 1800 + i, {"percent": 50.0})  # only first 30s
+        for i in range(30):
+            h.append(now - 60 + i, {"percent": 60.0})    # last 60s
+        s = h.series(["percent"], 1800, max_points=30)
+        vals = [v for _, v in s["percent"]]
+        self.assertIn(None, vals)
+
     def test_ring_evicts(self):
         h = History(maxlen=3)
         for i in range(10):

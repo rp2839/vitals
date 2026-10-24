@@ -65,7 +65,8 @@ class EstimatorTests(unittest.TestCase):
     def feed_one(self, battery, ac=False, clock=None):
         clock = clock or FakeClock()
         with tempfile.TemporaryDirectory() as td:
-            root = make_ps(Path_(td), dict(battery))
+            root = make_ps(Path_(td), dict(battery),
+                           ac_online=1 if ac else 0)
             r = PowerSupplyReader(root)
             est = BatteryEstimator(mono=clock)
             return est.feed(r.read_battery("BAT0"), r.ac_online())
@@ -131,13 +132,70 @@ class EstimatorTests(unittest.TestCase):
             self.assertEqual(st["quality"], "unavailable")
 
     def test_charge_based_fallback(self):
+        # charge_* are µAh on Linux; energy = µAh x µV / 1e6 = µWh
         b = {"present": 1, "status": "Discharging", "capacity": 50,
-             "charge_now": 2500, "charge_full": 5000,
-             "charge_full_design": 5200, "voltage_now": 11_000_000,
+             "charge_now": 2_500_000, "charge_full": 5_000_000,
+             "charge_full_design": 5_200_000, "voltage_now": 11_000_000,
              "power_now": 10_000_000}
         st = self.feed_one(b)
         self.assertAlmostEqual(st["percent"], 50.0, places=1)
+        self.assertAlmostEqual(st["energy_wh"], 27.5, places=1)
+        self.assertAlmostEqual(st["energy_full_wh"], 55.0, places=1)
         self.assertAlmostEqual(st["health_percent"], 100 * 5000 / 5200, places=1)
+
+    def test_stale_power_not_used_for_estimates(self):
+        # measured power, then power_now disappears: estimates must stop,
+        # not ride on the stale EMA (review finding, Codex major)
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as td:
+            root = make_ps(Path_(td), dict(HEALTHY))
+            r = PowerSupplyReader(root)
+            est = BatteryEstimator(mono=clock)
+            est.feed(r.read_battery("BAT0"), r.ac_online())
+            clock.advance(20)
+            (root / "BAT0" / "power_now").write_text("0\n")
+            st = est.feed(r.read_battery("BAT0"), r.ac_online())
+            self.assertIsNone(st["power_raw_w"])
+            self.assertIsNone(st["time_to_empty_s"])
+            self.assertTrue(st["estimating"])
+
+    def test_suspend_gap_clears_window(self):
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as td:
+            bat = dict(HEALTHY)
+            del bat["power_now"]
+            root = make_ps(Path_(td), dict(bat))
+            r = PowerSupplyReader(root)
+            est = BatteryEstimator(mono=clock)
+            for _ in range(5):
+                est.feed(r.read_battery("BAT0"), r.ac_online())
+                clock.advance(5)
+            clock.advance(3600)  # suspend
+            st = est.feed(r.read_battery("BAT0"), r.ac_online())
+            self.assertIsNone(st["power_raw_w"])
+
+    def test_configured_thresholds(self):
+        cfg = {"low_percent": 30, "critical_percent": 15}
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as td:
+            root = make_ps(Path_(td), dict(HEALTHY, energy_now=13_000_000))  # 27%
+            r = PowerSupplyReader(root)
+            est = BatteryEstimator(cfg, mono=clock)
+            st = est.feed(r.read_battery("BAT0"), r.ac_online())
+            self.assertEqual(st["state"], "low")
+
+    def test_device_loss_resets_state(self):
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as td:
+            root = make_ps(Path_(td), dict(HEALTHY))
+            r = PowerSupplyReader(root)
+            est = BatteryEstimator(mono=clock)
+            est.feed(r.read_battery("BAT0"), r.ac_online())
+            st = est.feed(None, True)
+            self.assertEqual(st["state"], "nobattery")
+            st = est.feed(r.read_battery("BAT0"), r.ac_online())
+            # fresh estimator: no stale power carried over
+            self.assertIsNone(st["time_to_empty_s"])
 
     def test_zero_power_suppresses_estimate(self):
         st = self.feed_one(dict(HEALTHY, power_now=0))

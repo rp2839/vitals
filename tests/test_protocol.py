@@ -27,7 +27,7 @@ class FrameTests(unittest.TestCase):
     def test_oversize_raises(self):
         p = protocol.FrameParser()
         with self.assertRaises(protocol.FrameParser.ProtocolError):
-            p.feed(b"x" * (protocol.MAX_FRAME + 1))
+            p.feed(b"x" * (protocol.MAX_FRAME + 1) + b"\n")
 
     def test_validate_request(self):
         op, rid = protocol.validate_request({"v": 1, "id": 7, "op": "ping"})
@@ -75,6 +75,26 @@ class RenderTests(unittest.TestCase):
         out = bar.render({"state": "nobattery", "percent": None,
                           "status": None}, {})
         self.assertEqual(out["class"], ["nobattery"])
+        self.assertIn("AC", out["text"])
+
+    def test_glyph_table_matches_spec_states(self):
+        # SPEC §2.2: held/nobattery use the plug glyph, alert for low/critical
+        self.assertEqual(bar.icon_for("held", 80), bar.ICON_PLUG)
+        self.assertEqual(bar.icon_for("nobattery", None), bar.ICON_PLUG)
+        self.assertEqual(bar.icon_for("low", 18), bar.ICON_ALERT)
+        self.assertEqual(bar.icon_for("critical", 5), bar.ICON_ALERT)
+        self.assertEqual(bar.icon_for("unknown", None), bar.ICON_UNKNOWN)
+        self.assertEqual(bar.icon_for("full", 100), bar.ICON_FULL)
+        self.assertEqual(bar.icon_for("discharging", 95), bar._LEVELS[0])
+        self.assertEqual(bar.icon_for("discharging", 45), bar._LEVELS[6])
+
+    def test_estimating_shows_ellipsis(self):
+        out = bar.render({"state": "discharging", "percent": 72,
+                          "status": "Discharging", "estimating": True}, {})
+        self.assertIn("· …", out["text"])
+
+    def test_time_format_hmm(self):
+        self.assertEqual(bar.fmt_time(41 * 60), "0:41")
 
 
 if __name__ == "__main__":

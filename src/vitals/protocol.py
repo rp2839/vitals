@@ -17,6 +17,10 @@ def encode(obj: dict) -> bytes:
     return (json.dumps(obj, separators=(",", ":"), allow_nan=False) + "\n").encode()
 
 
+def _reject_const(s: str):
+    raise FrameParser.ProtocolError(f"non-finite JSON constant: {s}")
+
+
 class FrameParser:
     """Feed bytes, get whole parsed dicts. Raises ProtocolError on bad input."""
 
@@ -28,17 +32,21 @@ class FrameParser:
 
     def feed(self, data: bytes) -> list[dict]:
         self._buf += data
-        if len(self._buf) > MAX_FRAME:
-            raise self.ProtocolError("frame too large")
+        if len(self._buf) > MAX_FRAME * 2:
+            raise self.ProtocolError("buffer too large")
         out = []
         while b"\n" in self._buf:
             line, self._buf = self._buf.split(b"\n", 1)
+            if len(line) > MAX_FRAME:
+                raise self.ProtocolError("frame too large")
             if not line.strip():
                 continue
             try:
-                obj = json.loads(line)
+                obj = json.loads(line, parse_constant=_reject_const)
             except json.JSONDecodeError as e:
                 raise self.ProtocolError(f"bad json: {e}") from e
+            except UnicodeDecodeError as e:
+                raise self.ProtocolError(f"invalid utf-8: {e}") from e
             if not isinstance(obj, dict):
                 raise self.ProtocolError("frame is not an object")
             out.append(obj)

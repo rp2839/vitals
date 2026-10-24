@@ -14,38 +14,45 @@ import time
 
 SOCK_ENV = "VITALS_SOCKET"
 
-# Nerd Font (material) battery glyphs, codepoints F0783..F0798
-_BATT = [chr(0xF0783 + (100 - p) // 10) for p in range(100, -1, -10)]  # 100..0
-_CHRG = [chr(0xF078E + (100 - p) // 10) for p in range(100, -1, -10)]
-ICON_ALERT = chr(0xF07BA)      # battery_alert
-ICON_UNKNOWN = chr(0xF0791)    # battery_unknown (approx)
-ICON_PLUG = chr(0xF0BA5)       # power plug
-ICON_FULL = chr(0xF078E)       # charging/full glyph
+# Nerd Font (material) glyphs — codepoints verified against the literals in
+# docs/SPEC.md §2.2 on this machine's gtk-layer-shell/nerd-font setup.
+# Levels: battery_100..battery_0 = U+F0079..U+F0083.
+_LEVELS = [chr(0xF0079 + i) for i in range(11)]        # index 0=100% .. 10=0%
+ICON_FULL = chr(0xF0085)      # plug-battery (full)
+ICON_PLUG = chr(0xF06A5)      # power plug (held / no battery)
+ICON_UNKNOWN = chr(0xF0091)   # battery unknown
+ICON_ALERT = chr(0xF00BA)     # battery alert (low / critical)
+ICON_CHARGING = chr(0xF0084)  # battery charging
 
 _ASCII = {"discharging": "BAT", "charging": "AC^", "full": "AC=", "held": "AC-",
           "low": "BAT!", "critical": "BAT!!", "nobattery": "AC",
           "unknown": "--"}
 
 
-def _icon(state: str, percent) -> str:
+def _level_icon(p: float) -> str:
+    step = min(100, max(0, int(round(p / 10.0) * 10)))
+    return _LEVELS[(100 - step) // 10]
+
+
+def icon_for(state: str, percent) -> str:
     if os.environ.get("VITALS_ASCII"):
         return _ASCII.get(state, "--")
-    p = 0 if percent is None else int(percent)
-    step = min(10, max(0, (p + 5) // 10)) * 10
-    if state in ("charging",):
-        return _CHRG[(100 - step) // 10]
+    if state in ("held", "nobattery"):
+        return ICON_PLUG
     if state == "full":
         return ICON_FULL
     if state in ("low", "critical"):
         return ICON_ALERT
-    if state == "nobattery":
-        return ICON_PLUG
     if state == "unknown":
         return ICON_UNKNOWN
-    return _BATT[(100 - step) // 10]
+    if state == "charging":
+        return ICON_CHARGING
+    p = 0 if percent is None else float(percent)
+    return _level_icon(p)
 
 
 def fmt_time(seconds) -> str | None:
+    """SPEC §2.3 format: H:MM (0:41), 1d 2h above 24h, <1m."""
     if seconds is None:
         return None
     if seconds < 60:
@@ -54,30 +61,26 @@ def fmt_time(seconds) -> str | None:
     m = (int(seconds) % 3600) // 60
     if h >= 24:
         return f"{h // 24}d {h % 24}h"
-    if h == 0:
-        return f"{m}m"
     return f"{h}:{m:02d}"
 
 
 def render(battery: dict, power: dict) -> dict:
     state = battery.get("state") or "unknown"
     pct = battery.get("percent")
-    icon = _icon(state, pct)
+    icon = icon_for(state, pct)
     parts: list[str] = [icon]
     text_pct = "--" if pct is None else f"{pct:.0f}%"
     if state == "nobattery":
-        parts = [icon]
+        parts = [icon, "AC"]
     else:
         parts.append(text_pct)
     # time
     if state in ("discharging", "low", "critical"):
         t = fmt_time(battery.get("time_to_empty_s"))
-        if t:
-            parts.append(f"· {t}")
+        parts.append(f"· {t}" if t else "· …")
     elif state == "charging":
         t = fmt_time(battery.get("time_to_full_s"))
-        if t:
-            parts.append(f"· {t}")
+        parts.append(f"· {t}" if t else "· …")
     elif state == "held":
         parts.append("· held")
     # optional watts (VITALS_BAR_WATTS=1)
@@ -132,7 +135,7 @@ def _emit(obj: dict) -> None:
 
 
 def _unknown(msg: str) -> dict:
-    return {"text": f"{_icon('unknown', None) if not os.environ.get('VITALS_ASCII') else '--'} --",
+    return {"text": f"{icon_for('unknown', None) if not os.environ.get('VITALS_ASCII') else '--'} --",
             "tooltip": msg, "class": ["unknown"], "alt": "unknown",
             "percentage": 0}
 

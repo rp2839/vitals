@@ -34,35 +34,27 @@ class History:
             return {f: [] for f in fields}
         if len(pts) <= max_points:
             return {f: [[t, v.get(f)] for t, v in pts] for f in fields}
-        # bucket-average downsample
+        # bucket-average downsample; empty buckets emit explicit nulls so
+        # graphs never connect across gaps (device loss, suspend, restart)
         n_buckets = max(1, max_points)
-        span = pts[-1][0] - pts[0][0]
-        if span <= 0:
-            span = 1.0
+        t_start = pts[0][0]
+        t_end = time.time()
+        span = max(t_end - t_start, 1.0)
         bucket_s = span / n_buckets
         out: dict[str, list] = {f: [] for f in fields}
-        cur_b = -1
-        acc: dict[str, list[float]] = {f: [] for f in fields}
-        acc_t: list[float] = []
-
-        def flush(b: int) -> None:
-            ts = pts[0][0] + (b + 0.5) * bucket_s
-            for f in fields:
-                vals = acc[f]
-                out[f].append([ts, sum(vals) / len(vals) if vals else None])
-                acc[f] = []
-            acc_t.clear()
-
+        acc: dict[int, dict[str, list[float]]] = {}
+        bucket_ts = [t_start + (b + 0.5) * bucket_s for b in range(n_buckets)]
         for t, v in pts:
-            b = min(int((t - pts[0][0]) / bucket_s), n_buckets - 1)
-            if b != cur_b:
-                if cur_b >= 0:
-                    flush(cur_b)
-                cur_b = b
+            b = min(max(int((t - t_start) / bucket_s), 0), n_buckets - 1)
+            slot = acc.setdefault(b, {f: [] for f in fields})
             for f in fields:
                 val = v.get(f)
                 if isinstance(val, (int, float)):
-                    acc[f].append(float(val))
-        if cur_b >= 0:
-            flush(cur_b)
+                    slot[f].append(float(val))
+        for b in range(n_buckets):
+            slot = acc.get(b)
+            for f in fields:
+                vals = slot[f] if slot else []
+                out[f].append([bucket_ts[b],
+                               sum(vals) / len(vals) if vals else None])
         return out

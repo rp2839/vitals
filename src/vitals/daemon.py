@@ -28,12 +28,16 @@ from .linux.inotify import (Inotify, IN_ATTRIB, IN_CREATE, IN_DELETE,
                             IN_DELETE_SELF, IN_MODIFY, IN_MOVED_FROM,
                             IN_MOVED_TO)
 from .linux.sysfs import PowerSupplyReader
+from .linux import uevent as uevent_mod
 
 PROTOCOL_VERSION = 1
 SAMPLE_ACTIVE_S = 5
+SAMPLE_PANEL_S = 2
 SAMPLE_IDLE_S = 30
 BROADCAST_INTERVAL_MS = 1000
 HISTORY_WINDOW_S = 24 * 3600
+BRIGHT_TTL_HIDDEN_S = 30.0
+BRIGHT_TTL_PANEL_S = 5.0
 
 
 def socket_path() -> Path:
@@ -83,7 +87,11 @@ class Client:
                 code = "unsupported_version" if "version" in str(e) else "invalid_request"
                 self.send(protocol.error_reply(obj.get("id"), code, str(e)))
                 continue
-            self.daemon.handle_request(self, op, rid, obj)
+            try:
+                self.daemon.handle_request(self, op, rid, obj)
+            except Exception as e:  # a bad request must never kill the watch
+                self.send(protocol.error_reply(rid, "internal",
+                                               f"handler error: {e.__class__.__name__}"))
         return True
 
     def send(self, obj: dict) -> None:
@@ -149,7 +157,8 @@ class Daemon:
         self.history = History(maxlen=7200)
         self.profiles = PowerProfiles(on_change=self._on_controls_changed)
         self.brightness = Brightness(cfg.get("brightness", "device", "auto"))
-        self.notifier = notify_mod.BatteryNotifier(cfg["notifications"])
+        self.notifier = notify_mod.BatteryNotifier(
+            cfg["notifications"], cfg["battery"])
         self.clients: set[Client] = set()
         self.battery_state: dict = {}
         self.panel_visible = False
@@ -158,12 +167,22 @@ class Daemon:
         self._sample_pending = False
         self._inotify: Inotify | None = None
         self._inotify_wd = None
+        self._uevent_fd = None
+        self._uevent_watch = None
         self._dirty = False
         self._last_history_ts = 0.0
         self._last_sample_mono = 0.0
         self._server_fd: socket.socket | None = None
         self._server_watch = None
         self._loop = None
+        # brightness cache (subprocess-backed; do not spawn per flush)
+        self._bright_cache: dict = {"value": None, "available": self.brightness.available,
+                                    "device": self.brightness.device,
+                                    "min": 1.0, "max": 100.0}
+        self._bright_cache_ts = 0.0
+        # power-source tracking for panel rows (SPEC §3.4)
+        self._last_ac: bool | None = None
+        self._ac_since = time.time()
 
     # ------------------------------------------------------------- lifecycle
     def start(self, loop) -> int:
@@ -186,8 +205,11 @@ class Daemon:
                 except OSError:
                     pass
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(str(path))
-        os.chmod(str(path), 0o600)
+        old_mask = os.umask(0o177)  # socket created 0600 (no bind/chmod race)
+        try:
+            srv.bind(str(path))
+        finally:
+            os.umask(old_mask)
         srv.listen(16)
         srv.setblocking(False)
         self._server_fd = srv
@@ -195,6 +217,7 @@ class Daemon:
 
         self.profiles.start()
         self._setup_inotify()
+        self._setup_uevent()
         self.sample_battery()          # first sample immediately
         self._schedule_sample()
         GLib.timeout_add(BROADCAST_INTERVAL_MS, self._flush_updates)
@@ -235,7 +258,31 @@ class Daemon:
                 | IN_ATTRIB | IN_MODIFY)
             GLib.io_add_watch(self._inotify.fd, GLib.IO_IN, self._on_inotify)
         except OSError:
+            if self._inotify:
+                try:
+                    self._inotify.close()
+                except OSError:
+                    pass
             self._inotify = None
+
+    def _setup_uevent(self) -> None:
+        try:
+            s = uevent_mod.open_uevent_socket()
+        except OSError:
+            return
+        self._uevent_fd = s
+        self._uevent_watch = GLib.io_add_watch(s, GLib.IO_IN, self._on_uevent)
+
+    def _on_uevent(self, *_a) -> bool:
+        try:
+            data = self._uevent_fd.recv(8192)
+        except (BlockingIOError, OSError):
+            return True
+        if data and uevent_mod.matches(data, ("power_supply",)):
+            self.sample_battery()
+            self._reschedule_sample()
+            self._flush_updates()  # immediate: <500ms plug/unplug target
+        return True
 
     def _on_inotify(self, *_a) -> bool:
         if not self._inotify:
@@ -254,12 +301,16 @@ class Daemon:
 
     def _schedule_sample(self) -> None:
         st = (self.battery_state.get("status") or "").lower()
-        active = st in ("discharging", "charging") or self.panel_visible
-        interval = SAMPLE_ACTIVE_S if active else SAMPLE_IDLE_S
+        if self.panel_visible:
+            interval_ms = SAMPLE_PANEL_S * 1000
+        elif st in ("discharging", "charging"):
+            interval_ms = SAMPLE_ACTIVE_S * 1000
+        else:
+            interval_ms = SAMPLE_IDLE_S * 1000
         if self._sample_handle:
             GLib.source_remove(self._sample_handle)
-        self._sample_handle = GLib.timeout_add_seconds(
-            interval, self._on_sample_timer)
+        self._sample_handle = GLib.timeout_add(
+            interval_ms, self._on_sample_timer)
 
     def _reschedule_sample(self) -> None:
         self._schedule_sample()
@@ -274,11 +325,16 @@ class Daemon:
         name = self.reader.find_battery(want)
         snap = self.reader.read_battery(name) if name else None
         ac = self.reader.ac_online()
+        prev_state = self.battery_state.get("state")
+        prev_ac = self._last_ac
         now = time.monotonic()
         state = self.estimator.feed(snap, ac)
         self.battery_state = state
         self._dirty = True
-        # history: one point per >=5s with real data
+        if ac != self._last_ac:
+            self._ac_since = time.time()
+            self._last_ac = ac
+        # history: one point per >=5s with real data; explicit gap marker on loss
         if state.get("percent") is not None and now - self._last_history_ts >= 5:
             self._last_history_ts = now
             self.history.append(state["observed_at"], {
@@ -286,20 +342,39 @@ class Daemon:
                 "power_w": state.get("power_w"),
                 "charging": 1 if (state.get("status") or "").lower() == "charging" else 0,
             })
+        elif state.get("percent") is None and now - self._last_history_ts >= 5:
+            self._last_history_ts = now
+            self.history.append(state["observed_at"], {})  # gap marker
         self.notifier.update(state)
+        # plug/unplug and state transitions flush immediately
+        if state.get("state") != prev_state or ac != prev_ac:
+            self._flush_updates()
 
     def _on_controls_changed(self) -> None:
         self._dirty = True
 
     # ------------------------------------------------------------- broadcast
+    def _brightness_state(self, force: bool = False) -> dict:
+        ttl = BRIGHT_TTL_PANEL_S if self.panel_visible else BRIGHT_TTL_HIDDEN_S
+        now = time.monotonic()
+        if force or now - self._bright_cache_ts >= ttl:
+            self._bright_cache = self.brightness.state()
+            self._bright_cache_ts = now
+        return self._bright_cache
+
     def module_data(self, modules: list[str] | None = None) -> dict:
         data = {}
         mods = modules or ["battery", "power"]
         if "battery" in mods:
-            data["battery"] = dict(self.battery_state)
+            b = dict(self.battery_state)
+            b["on_source_s"] = int(time.time() - self._ac_since)
+            avg = self.history.series(["power_w"], 600, max_points=120)
+            vals = [v for _, v in avg.get("power_w", []) if v is not None]
+            b["avg_power_10m_w"] = round(sum(vals) / len(vals), 1) if vals else None
+            data["battery"] = b
         if "power" in mods:
             ps = self.profiles.state()
-            bs = self.brightness.state()
+            bs = self._brightness_state()
             data["power"] = {
                 "active_profile": ps["active_profile"],
                 "profiles": ps["profiles"],
@@ -314,17 +389,19 @@ class Daemon:
     def _flush_updates(self) -> bool:
         if not self._dirty:
             return True
-        self._dirty = False
         now = time.monotonic()
+        keep_dirty = False
         for c in list(self.clients):
             mods = [m for m in ("battery", "power") if m in c.subscribed]
             if not mods:
                 continue
             if now - c.sub_since < 0.5:
-                continue  # subscriber gets its snapshot as the first event
+                keep_dirty = True  # subscriber's ack is its snapshot; keep dirty
+                continue
             self.seq += 1
             c.send({"v": 1, "event": "update", "seq": self.seq,
                     "data": self.module_data(mods)})
+        self._dirty = keep_dirty
         return True
 
     # ------------------------------------------------------------- requests
@@ -346,8 +423,8 @@ class Daemon:
             self.seq += 1
             c.send(protocol.reply(rid, True, seq=self.seq,
                                   data=self.module_data(
-                                      [m for m in c.subscribed if m in ("battery", "power")]))
-                     )
+                                      [m for m in c.subscribed if m in ("battery", "power")]),
+                                  panel={"visible": self.panel_visible}))
         elif op == "controls.get":
             c.send(protocol.reply(rid, True, data=self._controls_get()))
         elif op == "controls.set":
@@ -366,6 +443,8 @@ class Daemon:
                 self.panel_visible = vis
                 self._broadcast_panel()
                 self._schedule_sample()
+            if vis:
+                self._brightness_state(force=True)
             c.send(protocol.reply(rid, True, data={"panel": "battery",
                                                    "visible": self.panel_visible}))
         else:
@@ -408,6 +487,9 @@ class Daemon:
             return
         if ok:
             self._dirty = True
+            if control == "display.brightness":
+                self._brightness_state(force=True)
+                value = self._brightness_state()["value"]
             c.send(protocol.reply(rid, True, data={"control": control,
                                                    "value": value}))
         else:
@@ -421,10 +503,22 @@ class Daemon:
                                         f"no history for {module!r}"))
             return
         fields = req.get("fields") or ["percent", "power_w"]
-        window = float(req.get("window_s", 3600))
-        max_points = min(int(req.get("max_points", 1440)), 1440)
-        series = self.history.series(fields, min(window, HISTORY_WINDOW_S),
-                                     max_points)
+        if not isinstance(fields, list) or not all(isinstance(f, str) for f in fields):
+            c.send(protocol.error_reply(rid, "invalid_value",
+                                        "fields must be a list of strings"))
+            return
+        try:
+            window = float(req.get("window_s", 3600))
+            max_points = int(req.get("max_points", 1440))
+        except (TypeError, ValueError):
+            c.send(protocol.error_reply(rid, "invalid_value",
+                                        "window_s/max_points must be numbers"))
+            return
+        if not (0 < window <= HISTORY_WINDOW_S) or not (0 < max_points <= 1440):
+            c.send(protocol.error_reply(rid, "invalid_value",
+                                        "window_s/max_points out of range"))
+            return
+        series = self.history.series(fields, window, max_points)
         c.send(protocol.reply(rid, True, data={"module": module,
                                                "window_s": window,
                                                "series": series}))

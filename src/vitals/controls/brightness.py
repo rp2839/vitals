@@ -73,11 +73,19 @@ class Brightness:
             return False, "unavailable"
         target = max(1, round(mx * pct / 100.0))
         try:
-            _run(["-d", self.device, "set", str(target)])
+            proc = _run(["-d", self.device, "set", str(target)])
         except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False, "unavailable"
+        if proc.returncode != 0:
+            err = (proc.stderr or "").lower()
+            if "permission" in err or "denied" in err or "udev" in err:
+                return False, "permission_denied"
             return False, "unavailable"
         got, _ = self._raw()
         if got is None:
+            return False, "unavailable"
+        # confirm the device actually moved to (or near) the target
+        if abs(got - target) > max(1, mx // 100):
             return False, "unavailable"
         return True, None
 
