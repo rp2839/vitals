@@ -9,7 +9,7 @@
     "return-type": "json",
     "restart-interval": 3,
     "exec-on-event": false,
-    "on-click": "~/.local/bin/vitalsctl panel toggle battery",
+    "on-click": "~/.local/bin/vitalsctl panel toggle",
     "on-click-right": "~/.local/bin/vitalsctl profile cycle",
     "on-scroll-up": "~/.local/bin/vitalsctl brightness +5",
     "on-scroll-down": "~/.local/bin/vitalsctl brightness -5",
