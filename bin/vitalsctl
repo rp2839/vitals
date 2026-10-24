@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Wrapper for vitalsctl — works from the repo (src/) or an installed copy."""
+import os, sys
+_here = os.path.dirname(os.path.realpath(__file__))
+for _p in (os.path.join(_here, "..", "src"),
+           os.path.expanduser("~/.local/lib/vitals")):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+from vitals.clients.ctl import main
+sys.exit(main())

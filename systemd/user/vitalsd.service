@@ -1,0 +1,15 @@
+[Unit]
+Description=Vitals metrics and controls daemon
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vitalsd
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=vitals
+RuntimeDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target
