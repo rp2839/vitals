@@ -64,7 +64,10 @@ class DaemonClient:
         self.buf = b""
         self._retry = 2000
         self._pending: list[dict] = []
-        self._connect()
+        # Connect from the main loop rather than here: on_connected runs
+        # synchronously inside _connect() and its callback usually refers back
+        # to the client, which is not bound to a name until __init__ returns.
+        GLib.idle_add(self._connect)
 
     def _connect(self) -> bool:
         try:
