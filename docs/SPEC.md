@@ -237,3 +237,146 @@ Ordering: CPU → Memory → Network → Temperatures → Audio → Bluetooth �
 **Quality**
 13. Unit tests cover state classification, the time estimator (smoothing, suppression and taper), and the notification episode logic.
 14. A README documents the waybar snippet, the CSS classes, the Nerd Font requirement and the known limitations.
+
+## 8. Bluetooth module
+
+Tracking issue: #26. The user has asked for Bluetooth next, ahead of the §6 ordering. The coordinator owns the reordering.
+
+**Goal.** Replace `blueman-manager` as the way to check and manage Bluetooth. Blueman opens as an ordinary application window. Under Hyprland it is tiled, so it rearranges existing windows, and it has to be closed by hand. The Vitals Bluetooth panel keeps everything blueman does day to day, in the same layer-shell dropdown as Battery & Power. Like that panel, it closes when it loses focus.
+
+**Out of scope.** The following are not part of this module:
+- Bluetooth networking (PAN/DUN)
+- Receiving files over OBEX (P2)
+- Adapter-level advanced settings: class, name and the discoverable timeout
+- Running alongside `blueman-applet`. See DESIGN §10.5.
+
+### 8.1 Menu-bar indicator
+
+The indicator is one waybar module, `custom/vitals-bluetooth`. It replaces waybar's built-in `bluetooth` module. Text is `<icon>`, optionally followed by a connected-device count, and then, optionally, the lowest connected-device battery level:
+
+`󰂱 2 · 41%`
+
+| State | Condition | Icon | Text | CSS class |
+|---|---|---|---|---|
+| **Off** | Adapter `Powered` false, or soft rfkill block | `󰂲` | none | `off` |
+| **Blocked** | Hard rfkill block, such as a hardware switch | `󰂲` | `blocked` | `blocked` |
+| **On, idle** | Powered, no device connected | `󰂯` | none | `on` |
+| **Connected** | At least one device connected | `󰂱` | count (`2`), shown only when it is 2 or more | `connected` |
+| **Audio connected** | A connected device is an audio sink/headset | `󰂰` | as above | `connected audio` |
+| **Low device battery** | A connected device reports ≤ 15% | icon unchanged | battery field shown even when it is off in config | adds `lowbattery` (amber) |
+| **Busy** | Discovering, pairing, or a file transfer is running | `󰂴` while transferring, otherwise the state icon | unchanged | adds `busy` (pulsing) |
+| **No adapter** | No `org.bluez.Adapter1` present | `󰂲` | none, or hidden with `hide_when_no_adapter` | `noadapter` |
+| **Unknown / error** | BlueZ is not on the bus, or the daemon is down | `󰂲` | `--` | `unknown` |
+
+**Tooltip.** The tooltip shows adapter name and state, then one line per connected device: `M585/M590 · 41%`.
+
+**Clicks.**
+- Left click toggles the Bluetooth panel.
+- Right click toggles adapter power.
+- Middle click is reserved.
+- Scroll does nothing.
+
+**Updates.** Updates are driven only by BlueZ D-Bus signals; nothing is polled. A connect or disconnect reaches the bar in under 500 ms. As with the battery module, a line is emitted only when the output changes.
+
+### 8.2 Dropdown panel
+
+The panel uses the same window, styling, width, anchoring and dismissal rules as §3. It closes on Esc, on a second click of the indicator, or 0.5 s after it loses focus. Dismissal is suspended while a pairing prompt, the file chooser or a confirmation is open (DESIGN §10.7).
+
+Sections, top to bottom:
+
+**8.2.1 Header**
+- Bluetooth glyph, adapter alias (`fedora`) and a state label: `On`, `Off`, `Blocked by hardware switch`.
+- A power switch on the right. While it is in flight, the switch is insensitive and shows a spinner.
+- Turning Bluetooth on also clears a soft rfkill block. A hard block disables the switch and shows a note explaining why.
+
+**8.2.2 Connected devices**
+- One row per connected device: type icon from BlueZ `Icon`, name (`Alias`), battery level as a percentage with a thin bar (from `Battery1`) when one is reported, and a **Disconnect** button.
+- The battery bar turns amber at 15% or below.
+- Hidden when nothing is connected.
+
+**8.2.3 Paired devices**
+- Every paired device that is not connected, with a **Connect** button.
+- While a connect is in progress, the button shows a spinner and the row says `Connecting…`.
+- If the connect fails, the row shows the error inline for 5 s (`Device unreachable`, `Profile unavailable`).
+- Sorted by most recently connected, so the order is stable while the panel is open.
+
+**8.2.4 Device details (expander)**
+Clicking a device row in 8.2.2 or 8.2.3 expands it in place. Only one row is expanded at a time. The details are:
+- Address, type, and the battery source when known.
+- **Trusted.** A switch. Trusted devices may reconnect and use services without a prompt.
+- **Blocked.** A switch. Blocking disconnects the device and refuses future connections.
+- **Audio profile.** Shown for connected audio devices only. A selector: **Hi-Fi (A2DP)** · **Headset (HFP)** · **Off**, listing only the profiles the card offers.
+- **Send file…** Shown for devices that advertise OBEX Object Push. It opens a file chooser, then shows progress inline: `photo.jpg · 1.2 / 3.4 MB`, with **Cancel**.
+- **Rename.** An inline entry that sets the local `Alias`.
+- **Forget.** A destructive button. It needs a second click, `Click again to forget`, within 3 s.
+
+**8.2.5 Add device**
+- The section is collapsed by default and shows an **Add device…** button.
+- Expanding it starts discovery and makes the adapter pairable. Discovery stops when the section is collapsed, when the panel closes, or after 60 s, whichever comes first. **Scan again** restarts it.
+- A live list of discovered, unpaired devices shows icon, name and signal strength as a 4-step bar from `RSSI`, sorted by signal.
+- Devices with no name are hidden behind a `Show N unnamed devices` toggle.
+- Clicking a device pairs it. A successful pair also sets **Trusted** and then connects, which is blueman's default.
+- Pairing prompts appear inline in that row (8.2.6).
+
+**8.2.6 Pairing prompts**
+These come from the Vitals pairing agent (DESIGN §10.5):
+
+| Agent request | UI |
+|---|---|
+| Confirm passkey | `Does 123456 match the code on <device>?` with **Pair** and **Cancel** |
+| Display passkey / PIN | `Type 123456 on <device>`. Updates as keys are entered when the device reports them |
+| Request PIN / passkey | An entry field with **Pair** and **Cancel** |
+| Authorize pairing or service (untrusted device) | `<device> wants to connect` with **Allow**, **Always allow** (sets Trusted) and **Deny** |
+
+- A request the user does not answer is rejected after 30 s.
+- A request that arrives while the panel is closed comes from a device that initiated pairing. It opens the Bluetooth panel and also sends a notification, since the panel may be on another monitor.
+
+**8.2.7 Footer**
+- **Open blueman** runs `blueman-manager` as an escape hatch while this module is new.
+- A last-updated stamp is optional.
+
+### 8.3 Notifications
+
+These use the same mechanism, app name and replace-not-stack rules as §4, with the tag `vitals-bluetooth`.
+
+| Event | Default | Urgency | Text |
+|---|---|---|---|
+| Incoming pairing request | on | `critical` | "<device> wants to pair. Open Bluetooth to respond." |
+| Device battery low (≤ 15%, once per episode, 5% hysteresis) | on | `normal` | "<device> battery low: 12%" |
+| Device connected / disconnected | off | `low` | "<device> connected" |
+| File transfer finished / failed | on | `low` / `normal` | "Sent photo.jpg to <device>" |
+
+No notification fires for the state at daemon start.
+
+### 8.4 Feature list (Bluetooth)
+
+**P0: required for the first Bluetooth release**
+1. Multi-module and multi-panel support in the daemon, protocol, bar bridge and panel (DESIGN §10.1). This is a prerequisite.
+2. Indicator with every state in 8.1, event-driven.
+3. Header with power toggle, including rfkill handling.
+4. Connected and paired lists with connect/disconnect and device battery levels.
+5. Add device: discovery, pairing through the Vitals agent with the prompts in 8.2.6, then auto-trust and connect.
+6. Forget, with confirmation.
+7. Waybar and CSS snippets, plus README notes on replacing the built-in module and disabling `blueman-applet`.
+
+**P1**
+1. Trusted and Blocked switches, and Rename.
+2. Audio profile selector.
+3. Send file over OBEX, with progress and cancel.
+4. Notifications in 8.3.
+5. Config keys for the indicator fields, the low-battery threshold and the notification toggles.
+
+**P2**
+1. Receive files over OBEX: an `Agent1` on obexd with accept and reject prompts.
+2. Multiple adapters (an adapter selector in the header).
+3. Device battery history graph, reusing the battery sparkline.
+4. Codec display for audio devices (SBC, AAC, LDAC).
+
+### 8.5 Success criteria (Bluetooth)
+
+1. Toggling power from the panel, or by right-clicking the indicator, matches `bluetoothctl show`. A change made with `bluetoothctl power off` appears in the bar within 1 s.
+2. The M585/M590 mouse shows its `Battery1` percentage, which matches `busctl` within rounding.
+3. A new device pairs from the panel with no other agent running (`blueman-applet` and `bluetoothctl` agents stopped). Every prompt type that the test devices produce is exercised.
+4. Opening the panel does not move any tiled window, and the panel closes on focus loss except while a prompt or the file chooser is open.
+5. Discovery is never left running: `Discovering` is false within 1 s of the panel closing.
+6. With the panel hidden, idle CPU use matches the battery module. There are no Bluetooth timers, only signals.
