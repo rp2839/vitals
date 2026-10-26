@@ -53,6 +53,9 @@ def _load_config():
     return config_mod.load()
 
 
+HIDE_DELAY_MS = 500  # grace before focus-out dismissal
+
+
 class DaemonClient:
     """Socket client integrated with the GLib main loop."""
 
@@ -253,6 +256,7 @@ class Panel:
         # close on focus-out once the user has actually interacted (DESIGN §1);
         # this gtk-layer-shell build has no set_autohide binding
         self._had_focus = False
+        self._hide_timer = 0
         self.win.connect("focus-in-event", self._on_focus_in)
         self.win.connect("focus-out-event", self._on_focus_out)
 
@@ -626,6 +630,7 @@ class Panel:
         was = self.visible
         self.visible = False
         self._had_focus = False
+        self._cancel_hide()
         self.win.hide()
         if was and notify_daemon:
             # keep daemon-side visibility in sync (single-click reopen)
@@ -638,11 +643,25 @@ class Panel:
             return True
         return False
 
+    def _cancel_hide(self) -> None:
+        if self._hide_timer:
+            GLib.source_remove(self._hide_timer)
+            self._hide_timer = 0
+
     def _on_focus_in(self, *_a):
         self._had_focus = True
+        self._cancel_hide()
 
     def _on_focus_out(self, *_a):
-        if self.visible and self._had_focus:
+        # Grace period so the pointer can cross the gap between the bar and
+        # the panel (focus follows the mouse) without the panel vanishing.
+        if self.visible and self._had_focus and not self._hide_timer:
+            self._hide_timer = GLib.timeout_add(HIDE_DELAY_MS, self._hide_late)
+        return False
+
+    def _hide_late(self) -> bool:
+        self._hide_timer = 0
+        if self.visible:
             self.hide()
         return False
 
