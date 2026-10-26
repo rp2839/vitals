@@ -2,9 +2,9 @@
 """Wrapper for vitalsd — works from the repo (src/) or an installed copy."""
 import os, sys
 _here = os.path.dirname(os.path.realpath(__file__))
-for _p in (os.path.join(_here, "..", "src"),
-           os.path.expanduser("~/.local/lib/vitals")):
-    if os.path.isdir(_p) and _p not in sys.path:
-        sys.path.insert(0, _p)
+# the checkout's src/ takes precedence; the installed copy is the fallback
+sys.path[:0] = [_p for _p in (os.path.join(_here, "..", "src"),
+                              os.path.expanduser("~/.local/lib/vitals"))
+                if os.path.isdir(_p) and _p not in sys.path]
 from vitals.daemon import main
 sys.exit(main())
