@@ -627,7 +627,7 @@ Discovered, unpaired devices are only included while discovery is running, and a
 | `bluetooth.audio_profile` `{"profile":…}` | §10.6 | 5 s |
 | `bluetooth.send_file` `{"path":…}` / `cancel_transfer` | §10.8 | n/a |
 
-Adapter power is a control, `bluetooth.power` (boolean), set through `Adapter1.Powered`. When the adapter is soft-blocked, the daemon first unblocks it by writing an `RFKILL_OP_CHANGE` event (`struct rfkill_event`, type `RFKILL_TYPE_BLUETOOTH`, `soft=0`) to `/dev/rfkill`. This is what `rfkill unblock bluetooth` does. The sysfs `soft` attribute is root-only (`-rw-r--r-- root`), but `/dev/rfkill` carries an ACL (`crw-rw-r--+`), which is presumably the systemd-logind uaccess grant for the active session. Verify this on the target (see §10.10). If the write is denied, the panel reports that the adapter is blocked and offers **Open blueman**. Vitals does not use blueman's polkit rfkill helper.
+Adapter power is a control, `bluetooth.power` (boolean), set through `Adapter1.Powered`. When the adapter is soft-blocked, the daemon first unblocks it by writing an `RFKILL_OP_CHANGE` event (`struct rfkill_event`, type `RFKILL_TYPE_BLUETOOTH`, `soft=0`) to `/dev/rfkill`. This is what `rfkill unblock bluetooth` does. The sysfs `soft` attribute is root-only (`-rw-r--r-- root`), but `/dev/rfkill` carries an ACL (`crw-rw-r--+`), which is presumably the systemd-logind uaccess grant for the active session. Verified 2026-10-26: the logged-in user can open `/dev/rfkill` read-write. The unblock write itself has not been exercised yet, because the adapter was not blocked. If the write is denied, the panel reports that the adapter is blocked and offers **Open blueman**. Vitals does not use blueman's polkit rfkill helper.
 
 Rules:
 - **Device arguments.** `device` must be a MAC address that is already in the model. The daemon maps it to the object path itself, so clients never send D-Bus paths.
@@ -728,4 +728,4 @@ The 0.5 s focus-out grace (#24) closes the panel whenever focus leaves it. A pai
 - Run through every criterion in SPEC 8.5.
 - Pair one device of each type available: the mouse (Just Works), headphones (A2DP and HFP switching), and a phone (passkey confirmation and an OBEX send).
 - Restart `bluetooth.service` with the panel open, and check that the panel recovers and the agent re-registers (`busctl --system tree org.bluez` and a fresh pairing).
-- Check that the `/dev/rfkill` unblock works from the user service. Run `getfacl /dev/rfkill`; it printed nothing when this design was written, so the ACL holder is unconfirmed. If the write is denied, record the failure here and fall back as described in §10.3.
+- Soft-block Bluetooth (`rfkill block bluetooth`), then turn it on from Vitals. This exercises the `/dev/rfkill` unblock write from the user service. Opening the device read-write was confirmed on 2026-10-26. If the write is denied, record the failure here and fall back as described in §10.3.

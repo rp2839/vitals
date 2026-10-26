@@ -45,13 +45,13 @@ def make_daemon():
 class RegistryTests(unittest.TestCase):
     def test_builtin_modules_and_panel(self):
         d = make_daemon()
-        self.assertEqual(list(d.modules), ["battery", "power"])
+        self.assertEqual(list(d.modules), ["battery", "power", "bluetooth"])
         self.assertEqual(d.panels, {"battery"})
         self.assertIn("battery", d.histories)
 
     def test_module_data_all_and_filtered(self):
         d = make_daemon()
-        self.assertEqual(set(d.module_data()), {"battery", "power"})
+        self.assertEqual(set(d.module_data()), {"battery", "power", "bluetooth"})
         self.assertEqual(set(d.module_data(["power", "nope"])), {"power"})
 
     def test_registered_module_is_snapshotted_and_flushed(self):

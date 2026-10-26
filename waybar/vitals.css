@@ -28,6 +28,33 @@
     color: #928374;
 }
 
+#custom-vitals-bluetooth {
+    padding: 0 6px;
+}
+
+#custom-vitals-bluetooth.connected {
+    color: #83a598; /* blue */
+}
+
+#custom-vitals-bluetooth.off,
+#custom-vitals-bluetooth.blocked,
+#custom-vitals-bluetooth.noadapter,
+#custom-vitals-bluetooth.unknown {
+    color: #928374;
+}
+
+#custom-vitals-bluetooth.lowbattery {
+    color: #f9a825; /* amber */
+}
+
+#custom-vitals-bluetooth.busy {
+    animation: vitals-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes vitals-pulse {
+    50% { opacity: 0.5; }
+}
+
 @keyframes vitals-blink {
     50% { opacity: 0.35; }
 }

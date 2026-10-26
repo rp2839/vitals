@@ -21,6 +21,7 @@ from gi.repository import GLib, Gio
 from . import config as config_mod
 from . import notify as notify_mod
 from . import protocol
+from .collectors import bluetooth as bt_mod
 from .collectors.battery import BatteryEstimator
 from .collectors.power_profiles import PowerProfiles
 from .controls.brightness import Brightness
@@ -28,7 +29,9 @@ from .history import History
 from .linux.inotify import (Inotify, IN_ATTRIB, IN_CREATE, IN_DELETE,
                             IN_DELETE_SELF, IN_MODIFY, IN_MOVED_FROM,
                             IN_MOVED_TO)
+from .linux.bluez import BluezBackend
 from .linux.sysfs import PowerSupplyReader
+from .linux import rfkill as rfkill_mod
 from .linux import uevent as uevent_mod
 
 PROTOCOL_VERSION = 1
@@ -39,6 +42,13 @@ BROADCAST_INTERVAL_MS = 1000
 HISTORY_WINDOW_S = 24 * 3600
 BRIGHT_TTL_HIDDEN_S = 30.0
 BRIGHT_TTL_PANEL_S = 5.0
+BT_FLUSH_MS = 100          # coalesce BlueZ signal bursts; <500 ms to the bar
+
+# action name -> (Device1 method, timeout ms, busy label)
+BT_DEVICE_ACTIONS = {
+    "bluetooth.connect": ("Connect", 30000, "connecting"),
+    "bluetooth.disconnect": ("Disconnect", 10000, "disconnecting"),
+}
 
 
 def socket_path() -> Path:
@@ -160,6 +170,10 @@ class Daemon:
         self.brightness = Brightness(cfg.get("brightness", "device", "auto"))
         self.notifier = notify_mod.BatteryNotifier(
             cfg["notifications"], cfg["battery"])
+        self.bluez = BluezBackend(on_change=self._on_bt_changed)
+        self.bt_rfkill = rfkill_mod.state()
+        self.bt_busy: dict[str, str] = {}   # MAC -> busy label (SPEC 8.2)
+        self._bt_flush_pending = False
         self.clients: set[Client] = set()
         self.battery_state: dict = {}
         # module name -> callable returning that module's full current state
@@ -192,6 +206,7 @@ class Daemon:
 
         self.register_module("battery", self._battery_data, history=self.history)
         self.register_module("power", self._power_data)
+        self.register_module("bluetooth", self._bluetooth_data)
         self.register_panel("battery")
 
     # ------------------------------------------------------------- registry
@@ -241,6 +256,7 @@ class Daemon:
         self._server_watch = GLib.io_add_watch(srv, GLib.IO_IN, self._on_accept)
 
         self.profiles.start()
+        self.bluez.start()
         self._setup_inotify()
         self._setup_uevent()
         self.sample_battery()          # first sample immediately
@@ -259,6 +275,7 @@ class Daemon:
     def shutdown(self) -> None:
         for c in list(self.clients):
             c.close()
+        self.bluez.stop()
         if self._inotify:
             try:
                 self._inotify.close()
@@ -307,6 +324,9 @@ class Daemon:
             self.sample_battery()
             self._reschedule_sample()
             self._flush_updates()  # immediate: <500ms plug/unplug target
+        if data and uevent_mod.matches(data, ("rfkill",)):
+            self.bt_rfkill = rfkill_mod.state()
+            self._on_bt_changed()
         return True
 
     def _on_inotify(self, *_a) -> bool:
@@ -378,6 +398,17 @@ class Daemon:
     def _on_controls_changed(self) -> None:
         self._dirty = True
 
+    def _on_bt_changed(self) -> None:
+        self._dirty = True
+        if not self._bt_flush_pending:
+            self._bt_flush_pending = True
+            GLib.timeout_add(BT_FLUSH_MS, self._bt_flush)
+
+    def _bt_flush(self) -> bool:
+        self._bt_flush_pending = False
+        self._flush_updates()
+        return False
+
     # ------------------------------------------------------------- broadcast
     def _brightness_state(self, force: bool = False) -> dict:
         ttl = BRIGHT_TTL_PANEL_S if self.panel_visible else BRIGHT_TTL_HIDDEN_S
@@ -407,6 +438,10 @@ class Daemon:
             "brightness_available": bs["available"],
             "brightness_device": bs["device"],
         }
+
+    def _bluetooth_data(self) -> dict:
+        return bt_mod.snapshot(self.bluez.model, self.bluez.available,
+                               self.bt_rfkill, self.bt_busy)
 
     def module_data(self, modules: list[str] | None = None) -> dict:
         """State for the requested registered modules (all when None);
@@ -457,7 +492,12 @@ class Daemon:
         elif op == "controls.get":
             c.send(protocol.reply(rid, True, data=self._controls_get()))
         elif op == "controls.set":
-            self._controls_set(c, rid, req)
+            if req.get("control") == "bluetooth.power":
+                self._bt_set_power(c, rid, req.get("value"))
+            else:
+                self._controls_set(c, rid, req)
+        elif op == "action":
+            self._action(c, rid, req)
         elif op == "history.get":
             self._history_get(c, rid, req)
         elif op in ("panel.toggle", "panel.set"):
@@ -480,6 +520,7 @@ class Daemon:
                                         f"unknown op {op!r}"))
 
     def _controls_get(self) -> dict:
+        ad = self.bluez.model.adapter() if self.bluez.available else None
         ps = self.profiles.state()
         bs = self.brightness.state()
         return {
@@ -492,6 +533,11 @@ class Daemon:
                                    "available": bs["available"],
                                    "writable": "unknown",
                                    "device": bs["device"]},
+            "bluetooth.power": {"value": bool(ad and ad.get("Powered"))
+                                and self.bt_rfkill not in ("soft", "hard"),
+                                "available": ad is not None
+                                and self.bt_rfkill != "hard",
+                                "writable": "unknown"},
         }
 
     def _controls_set(self, c: Client, rid, req: dict) -> None:
@@ -523,6 +569,74 @@ class Daemon:
         else:
             c.send(protocol.error_reply(rid, err or "unavailable",
                                         f"{control} change failed"))
+
+    # ------------------------------------------------------------ bluetooth
+    def _bt_set_power(self, c: Client, rid, value) -> None:
+        if not isinstance(value, bool):
+            c.send(protocol.error_reply(rid, "invalid_value",
+                                        "bluetooth.power must be a boolean"))
+            return
+        if value and self.bt_rfkill == "hard":
+            c.send(protocol.error_reply(rid, "blocked",
+                                        "Bluetooth is blocked by a hardware switch"))
+            return
+
+        def done(ok: bool, err: str | None) -> None:
+            if ok:
+                self._on_bt_changed()
+                c.send(protocol.reply(rid, True, data={
+                    "control": "bluetooth.power", "value": value}))
+            else:
+                c.send(protocol.error_reply(rid, err or "unavailable",
+                                            "Bluetooth power change failed"))
+
+        if value and self.bt_rfkill == "soft":
+            ok, err = rfkill_mod.unblock()
+            if not ok:
+                done(False, err)
+                return
+            self.bt_rfkill = rfkill_mod.state()
+            def power_on() -> bool:
+                self.bluez.set_powered(True, done)
+                return False
+
+            # give bluetoothd a moment to see the unblock before powering on
+            GLib.timeout_add(300, power_on)
+            return
+        self.bluez.set_powered(value, done)
+
+    def _action(self, c: Client, rid, req: dict) -> None:
+        action = req.get("action")
+        args = req.get("args") or {}
+        if action not in BT_DEVICE_ACTIONS:
+            c.send(protocol.error_reply(rid, "unknown_action",
+                                        f"unknown action {action!r}"))
+            return
+        mac = args.get("device") if isinstance(args, dict) else None
+        mac = mac.upper() if isinstance(mac, str) else ""
+        if not bt_mod.MAC_RE.match(mac) or self.bluez.model.device_path(mac) is None:
+            c.send(protocol.error_reply(rid, "invalid_value",
+                                        "device must be a known MAC address"))
+            return
+        if mac in self.bt_busy:
+            c.send(protocol.error_reply(rid, "busy",
+                                        f"device is {self.bt_busy[mac]}"))
+            return
+        method, timeout_ms, label = BT_DEVICE_ACTIONS[action]
+        self.bt_busy[mac] = label
+        self._on_bt_changed()
+
+        def done(ok: bool, err: str | None) -> None:
+            self.bt_busy.pop(mac, None)
+            self._on_bt_changed()
+            if ok:
+                c.send(protocol.reply(rid, True, data={"action": action,
+                                                       "device": mac}))
+            else:
+                c.send(protocol.error_reply(rid, err or "unavailable",
+                                            f"{action} failed"))
+
+        self.bluez.device_call(mac, method, timeout_ms, done)
 
     def _history_get(self, c: Client, rid, req: dict) -> None:
         module = req.get("module", "battery")

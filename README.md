@@ -25,7 +25,7 @@ sysfs / inotify / D-Bus (power-profiles-daemon) / brightnessctl
 - `vitalsd` — the daemon: collectors, history, controls, notifications.
 - `vitals-bar` — waybar `custom/` module bridge (streams one JSON object per line).
 - `vitals-panel` — layer-shell dropdown (anchored top-right, autohide, Esc closes).
-- `vitalsctl` — CLI: `status`, `panel toggle|show|hide [NAME]` (default `battery`), `profile <name|get|cycle>`, `brightness <N|get|+5|-5>`.
+- `vitalsctl` — CLI: `status`, `panel toggle|show|hide [NAME]` (default `battery`), `bluetooth power on|off|toggle`, `bluetooth connect|disconnect <MAC>`, `profile <name|get|cycle>`, `brightness <N|get|+5|-5>`.
 
 Docs: [product spec](docs/SPEC.md) · [technical design](docs/DESIGN.md) ·
 [contrib workflow](docs/WORKFLOW.md)
@@ -47,9 +47,14 @@ systemctl --user enable --now vitalsd vitals-panel
 ```
 
 Then merge `waybar/vitals.jsonc` into `~/.config/waybar/config.jsonc`
-(add `custom/vitals-battery` to `modules-right`) and append
+(add `custom/vitals-battery` and `custom/vitals-bluetooth` to
+`modules-right`, removing the built-in `bluetooth` module) and append
 `waybar/vitals.css` to `~/.config/waybar/style.css`, then
 `killall -USR2 waybar`.
+
+Bluetooth pairing will be handled by Vitals' own agent (SPEC §8). Don't
+run `blueman-applet` alongside it, because it would take over as the
+default agent.
 
 ## Configuration
 
