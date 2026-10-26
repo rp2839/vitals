@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
 
 from vitals import config as config_mod  # noqa: E402
 from vitals.clients import bar  # noqa: E402
@@ -101,6 +102,46 @@ class SnapshotTests(unittest.TestCase):
         s = bt.snapshot(model(), False, "none")
         self.assertIsNone(s["adapter"])
         self.assertEqual(s["devices"], [])
+
+
+class LastConnectedTests(unittest.TestCase):
+    def test_transitions_and_persistence(self):
+        path = Path(tempfile.mkdtemp()) / "sub" / "bluetooth.json"
+        lc = bt.LastConnected(path)
+        # first update: already-connected devices get a time only if unknown
+        self.assertTrue(lc.update({"aa:bb:cc:dd:ee:01"}, now=100))
+        self.assertEqual(lc.times, {"AA:BB:CC:DD:EE:01": 100})
+        self.assertFalse(lc.update({"AA:BB:CC:DD:EE:01"}, now=200))   # still connected
+        self.assertFalse(lc.update(set(), now=300))                   # disconnect
+        self.assertTrue(lc.update({"AA:BB:CC:DD:EE:01"}, now=400))    # reconnect
+        self.assertEqual(bt.LastConnected(path).times, {"AA:BB:CC:DD:EE:01": 400})
+
+    def test_restart_keeps_known_times(self):
+        path = Path(tempfile.mkdtemp()) / "bluetooth.json"
+        path.write_text('{"AA:BB:CC:DD:EE:01": 50, "junk": "x"}')
+        lc = bt.LastConnected(path)
+        self.assertEqual(lc.times, {"AA:BB:CC:DD:EE:01": 50})
+        self.assertFalse(lc.update({"AA:BB:CC:DD:EE:01"}, now=999))
+        path.write_text("not json")
+        self.assertEqual(bt.LastConnected(path).times, {})
+
+    def test_snapshot_and_sections_order(self):
+        m = model()
+        extra = HCI + "/dev_AA_BB_CC_DD_EE_02"
+        m.interfaces_added(extra, {bt.DEVICE: {"Address": "AA:BB:CC:DD:EE:02",
+                                               "Alias": "Keyboard", "Paired": True,
+                                               "Adapter": HCI}})
+        never = HCI + "/dev_AA_BB_CC_DD_EE_03"
+        m.interfaces_added(never, {bt.DEVICE: {"Address": "AA:BB:CC:DD:EE:03",
+                                               "Alias": "Aardvark", "Paired": True,
+                                               "Adapter": HCI}})
+        snap = bt.snapshot(m, True, "none", last_connected={
+            "AA:BB:CC:DD:EE:01": 1000.0, "AA:BB:CC:DD:EE:02": 2000.0})
+        connected, paired = bt.sections(snap)
+        self.assertEqual([d["alias"] for d in connected], ["M585/M590"])
+        self.assertEqual([d["alias"] for d in paired],
+                         ["Keyboard", "Headphones", "Aardvark"])
+        self.assertEqual(paired[0]["last_connected"], "1970-01-01T00:33:20Z")
 
 
 class ClassifyTests(unittest.TestCase):

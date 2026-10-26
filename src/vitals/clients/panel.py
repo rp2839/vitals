@@ -20,7 +20,10 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("GtkLayerShell", "0.1")
 from gi.repository import Gdk, GLib, Gtk, GtkLayerShell, Pango  # noqa: E402
 
-from .bar import connect, fmt_time  # noqa: E402
+from ..collectors.bluetooth import classify as bt_classify  # noqa: E402
+from ..collectors.bluetooth import sections as bt_sections  # noqa: E402
+from .bar import (BT_AUDIO, BT_CONNECTED, BT_OFF, BT_ON,  # noqa: E402
+                  connect, fmt_time)
 
 RANGES = {"1h": 3600, "6h": 6 * 3600}
 
@@ -45,6 +48,17 @@ window.vitals-panel { background: #1d2021; color: #d5c4a1; border-radius: 10px;
 .vitals-panel button.close { padding: 0 8px; }
 .vitals-panel trough highlight { background: #689d6a; }
 .vitals-panel .wearbar trough highlight.low { background: #fb4934; }
+.vitals-panel .bt-glyph { font-size: 26px; }
+.vitals-panel .dev-icon { font-size: 18px; min-width: 24px; }
+.vitals-panel .dev-name { font-size: 12px; }
+.vitals-panel .error { color: #fb4934; font-size: 11px; }
+.vitals-panel button.dev { padding: 0 8px; border-radius: 6px;
+                           border: 1px solid #3c3836; background: #282828;
+                           color: #d5c4a1; font-size: 11px; }
+.vitals-panel levelbar block.filled { background: #689d6a; }
+.vitals-panel levelbar.low block.filled { background: #f9a825; }
+.vitals-panel levelbar block.empty { background: #3c3836; }
+.vitals-panel switch:checked { background: #689d6a; }
 """
 
 
@@ -279,6 +293,9 @@ class BasePanel:
 
     def on_shown(self) -> None:
         pass
+
+    def on_reply(self, msg: dict) -> None:
+        """Every request reply (ok or error); match on msg["id"]."""
 
     def on_daemon_lost(self) -> None:
         self.hide(notify_daemon=False)
@@ -671,7 +688,317 @@ class BatteryPanel(BasePanel):
                       "window_s": RANGES[self.range_key], "max_points": 360})
 
 
-PANELS: dict[str, type[BasePanel]] = {p.name: p for p in (BatteryPanel,)}
+# Device glyphs by BlueZ Icon (Nerd Font material); default: bluetooth
+DEV_ICONS = {
+    "input-mouse": chr(0xF037D), "input-keyboard": chr(0xF030C),
+    "audio-headphones": chr(0xF02CB), "audio-headset": chr(0xF02CE),
+    "audio-card": chr(0xF04C3), "phone": chr(0xF011C),
+    "computer": chr(0xF0379),
+}
+BT_ERRORS = {
+    "unreachable": "Device unreachable", "profile_unavailable": "Profile unavailable",
+    "auth_failed": "Authentication failed", "timeout": "Timed out",
+    "busy": "Busy", "blocked": "Blocked by rfkill",
+    "permission_denied": "Permission denied", "unavailable": "Bluetooth unavailable",
+}
+BUSY_TEXT = {"connecting": "Connecting…", "disconnecting": "Disconnecting…"}
+ERROR_SHOW_MS = 5000
+
+
+class DeviceRow(Gtk.Box):
+    """One device line: icon, name, status/battery, action button."""
+
+    def __init__(self, panel: "BluetoothPanel", mac: str):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.panel = panel
+        self.mac = mac
+        self.connected = False
+        self.pending = False
+        self._error_timer = 0
+        self.get_style_context().add_class("section")
+        self.icon = Gtk.Label()
+        self.icon.get_style_context().add_class("dev-icon")
+        self.pack_start(self.icon, False, False, 0)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.name = Gtk.Label(xalign=0)
+        self.name.get_style_context().add_class("dev-name")
+        self.name.set_ellipsize(Pango.EllipsizeMode.END)
+        col.pack_start(self.name, False, False, 0)
+        sub = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.level = Gtk.LevelBar(min_value=0, max_value=100)
+        self.level.set_size_request(48, 4)
+        self.level.set_valign(Gtk.Align.CENTER)
+        self.level.set_no_show_all(True)
+        sub.pack_start(self.level, False, False, 0)
+        self.status = Gtk.Label(xalign=0)
+        self.status.get_style_context().add_class("dim")
+        sub.pack_start(self.status, False, False, 0)
+        col.pack_start(sub, False, False, 0)
+        self.pack_start(col, True, True, 0)
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_no_show_all(True)
+        self.pack_start(self.spinner, False, False, 0)
+        self.button = Gtk.Button()
+        self.button.get_style_context().add_class("dev")
+        self.button.set_valign(Gtk.Align.CENTER)
+        self.button.connect("clicked", self._on_click)
+        self.pack_start(self.button, False, False, 0)
+
+    def update(self, d: dict, low: int) -> None:
+        self.connected = bool(d.get("connected"))
+        self.icon.set_text(DEV_ICONS.get(d.get("icon") or "", BT_ON))
+        self.name.set_text(d.get("alias") or self.mac)
+        busy = d.get("busy")
+        working = bool(busy) or self.pending
+        self.spinner.set_visible(working)
+        if working:
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+        self.button.set_label("Disconnect" if self.connected else "Connect")
+        self.button.set_sensitive(not working)
+        pct = d.get("battery")
+        show_level = self.connected and pct is not None
+        self.level.set_visible(show_level)
+        if show_level:
+            self.level.set_value(pct)
+            ctx = self.level.get_style_context()
+            if pct <= low:
+                ctx.add_class("low")
+            else:
+                ctx.remove_class("low")
+        if self._error_timer:
+            return  # keep the error visible for its full duration
+        if busy:
+            self.status.set_text(BUSY_TEXT.get(busy, busy))
+        elif show_level:
+            self.status.set_text(f"{pct}%")
+        else:
+            self.status.set_text("Connected" if self.connected else "")
+
+    def show_error(self, text: str) -> None:
+        self.pending = False
+        if self._error_timer:
+            GLib.source_remove(self._error_timer)
+        ctx = self.status.get_style_context()
+        ctx.remove_class("dim")
+        ctx.add_class("error")
+        self.status.set_text(text)
+        self._error_timer = GLib.timeout_add(ERROR_SHOW_MS, self._clear_error)
+
+    def _clear_error(self) -> bool:
+        self._error_timer = 0
+        ctx = self.status.get_style_context()
+        ctx.remove_class("error")
+        ctx.add_class("dim")
+        self.panel.on_data()
+        return False
+
+    def _on_click(self, _b) -> None:
+        self.pending = True
+        self.spinner.show()
+        self.spinner.start()
+        self.button.set_sensitive(False)
+        action = "bluetooth.disconnect" if self.connected else "bluetooth.connect"
+        self.panel.app.dc.send({"v": 1, "id": f"bt:{self.mac}", "op": "action",
+                                "action": action, "args": {"device": self.mac}})
+
+
+class BluetoothPanel(BasePanel):
+    """SPEC §8.2: header with power switch, connected and paired devices."""
+
+    name = "bluetooth"
+    modules = ("bluetooth",)
+
+    def __init__(self, app: "PanelApp"):
+        self.rows: dict[str, DeviceRow] = {}
+        self._setting = False
+        self._power_pending = False
+        self._note_timer = 0
+        self.low = int(app.cfg.get("bluetooth", "low_battery_percent", 15))
+        super().__init__(app)
+
+    def build(self, root: Gtk.Box) -> None:
+        # -- header: glyph, adapter name + state, power switch
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        head.get_style_context().add_class("section")
+        head.set_margin_top(10)
+        root.pack_start(head, False, False, 0)
+        self.glyph = Gtk.Label(label=BT_OFF)
+        self.glyph.get_style_context().add_class("bt-glyph")
+        head.pack_start(self.glyph, False, False, 0)
+        hcol = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        hcol.set_valign(Gtk.Align.CENTER)
+        self.lbl_alias = Gtk.Label(label="Bluetooth", xalign=0)
+        self.lbl_alias.get_style_context().add_class("big")
+        hcol.pack_start(self.lbl_alias, False, False, 0)
+        self.lbl_state = Gtk.Label(label="", xalign=0)
+        self.lbl_state.get_style_context().add_class("head-state")
+        hcol.pack_start(self.lbl_state, False, False, 0)
+        head.pack_start(hcol, True, True, 0)
+        self.switch = Gtk.Switch()
+        self.switch.set_valign(Gtk.Align.CENTER)
+        self.switch.connect("notify::active", self._on_switch)
+        head.pack_end(self.switch, False, False, 0)
+        self.power_spinner = Gtk.Spinner()
+        self.power_spinner.set_no_show_all(True)
+        head.pack_end(self.power_spinner, False, False, 0)
+        self.lbl_note = Gtk.Label(xalign=0)
+        self.lbl_note.get_style_context().add_class("dim")
+        self.lbl_note.set_line_wrap(True)
+        self.lbl_note.get_style_context().add_class("section")
+        self.lbl_note.set_no_show_all(True)
+        root.pack_start(self.lbl_note, False, False, 0)
+
+        root.pack_start(self._sep(), False, False, 0)
+
+        # -- device lists
+        self.lbl_conn = self._lbl("Connected")
+        self.lbl_conn.get_style_context().add_class("section")
+        self.lbl_conn.set_no_show_all(True)
+        root.pack_start(self.lbl_conn, False, False, 0)
+        self.box_conn = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.pack_start(self.box_conn, False, False, 0)
+        self.lbl_paired = self._lbl("Paired devices")
+        self.lbl_paired.get_style_context().add_class("section")
+        self.lbl_paired.set_no_show_all(True)
+        root.pack_start(self.lbl_paired, False, False, 0)
+        self.box_paired = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.pack_start(self.box_paired, False, False, 0)
+        self.lbl_empty = Gtk.Label(label="No paired devices")
+        self.lbl_empty.get_style_context().add_class("dim")
+        self.lbl_empty.get_style_context().add_class("section")
+        self.lbl_empty.set_no_show_all(True)
+        root.pack_start(self.lbl_empty, False, False, 0)
+
+        root.pack_start(self._sep(), False, False, 0)
+
+        # -- footer
+        foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        foot.get_style_context().add_class("section")
+        foot.set_margin_bottom(8)
+        if GLib.find_program_in_path("blueman-manager"):
+            blueman = Gtk.Button(label="Open blueman")
+            blueman.get_style_context().add_class("dev")
+            blueman.connect("clicked", self._open_blueman)
+            foot.pack_start(blueman, False, False, 0)
+        self.lbl_updated = Gtk.Label(label="")
+        self.lbl_updated.get_style_context().add_class("dim")
+        foot.pack_start(self.lbl_updated, True, True, 0)
+        foot.pack_end(self._close_button(), False, False, 0)
+        root.pack_start(foot, False, False, 0)
+
+    # --------------------------------------------------------------- hooks
+    def on_data(self) -> None:
+        bt = self.app.cache.get("bluetooth", {})
+        state, classes = bt_classify(bt, self.low)
+        ad = bt.get("adapter") or {}
+        connected, paired = bt_sections(bt)
+
+        self.glyph.set_text({"on": BT_ON, "connected":
+                             BT_AUDIO if "audio" in classes else BT_CONNECTED
+                             }.get(state, BT_OFF))
+        self.lbl_alias.set_text(ad.get("alias") or "Bluetooth")
+        label = {"on": "On", "connected": f"On · {len(connected)} connected",
+                 "off": "Off", "blocked": "Blocked by hardware switch",
+                 "noadapter": "No adapter", "unknown": "Bluetooth unavailable"}
+        self.lbl_state.set_text(label[state])
+        if not self._power_pending:
+            self._setting = True
+            self.switch.set_active(state in ("on", "connected"))
+            self._setting = False
+            self.switch.set_sensitive(state in ("on", "connected", "off"))
+        if not self._note_timer:
+            note = ("Turn off the hardware wireless switch to use Bluetooth."
+                    if state == "blocked" else "")
+            self.lbl_note.set_text(note)
+            self.lbl_note.set_visible(bool(note))
+
+        powered = state in ("on", "connected")
+        seen = set()
+        for box, devs in ((self.box_conn, connected), (self.box_paired, paired)):
+            for i, d in enumerate(devs if powered else []):
+                mac = d.get("address")
+                if not mac:
+                    continue
+                seen.add(mac)
+                row = self.rows.get(mac)
+                if row is None:
+                    row = self.rows[mac] = DeviceRow(self, mac)
+                if row.get_parent() is not box:
+                    if row.get_parent():
+                        row.get_parent().remove(row)
+                    box.pack_start(row, False, False, 0)
+                    row.show_all()
+                box.reorder_child(row, i)
+                row.update(d, self.low)
+        for mac in list(self.rows):
+            if mac not in seen:
+                self.rows.pop(mac).destroy()
+        self.lbl_conn.set_visible(powered and bool(connected))
+        self.lbl_paired.set_visible(powered and bool(paired))
+        self.lbl_empty.set_visible(powered and not connected and not paired)
+        self.lbl_updated.set_text(time.strftime("updated %H:%M:%S"))
+
+    def on_reply(self, msg: dict) -> None:
+        rid = msg.get("id")
+        if not isinstance(rid, str):
+            return
+        err = (msg.get("error") or {}).get("code")
+        if rid == "bt-power":
+            self._power_pending = False
+            self.power_spinner.stop()
+            self.power_spinner.hide()
+            if err:
+                self._show_note(BT_ERRORS.get(err, "Could not change Bluetooth power"))
+            self.on_data()
+        elif rid.startswith("bt:"):
+            row = self.rows.get(rid[3:])
+            if row is None:
+                return
+            row.pending = False
+            if err:
+                row.show_error(BT_ERRORS.get(err, "Failed"))
+            self.on_data()
+
+    def on_daemon_lost(self) -> None:
+        super().on_daemon_lost()
+        self.lbl_state.set_text("daemon offline")
+
+    # ------------------------------------------------------------- actions
+    def _on_switch(self, sw, _pspec) -> None:
+        if self._setting:
+            return
+        self._power_pending = True
+        self.switch.set_sensitive(False)
+        self.power_spinner.show()
+        self.power_spinner.start()
+        self.app.dc.send({"v": 1, "id": "bt-power", "op": "controls.set",
+                          "control": "bluetooth.power", "value": sw.get_active()})
+
+    def _show_note(self, text: str) -> None:
+        if self._note_timer:
+            GLib.source_remove(self._note_timer)
+        self.lbl_note.set_text(text)
+        self.lbl_note.show()
+        self._note_timer = GLib.timeout_add(ERROR_SHOW_MS, self._clear_note)
+
+    def _clear_note(self) -> bool:
+        self._note_timer = 0
+        self.on_data()
+        return False
+
+    def _open_blueman(self, _b) -> None:
+        try:
+            GLib.spawn_async(["blueman-manager"],
+                             flags=GLib.SpawnFlags.SEARCH_PATH)
+        except GLib.Error:
+            self._show_note("Could not start blueman-manager")
+            return
+        self.hide()
+
+
+PANELS: dict[str, type[BasePanel]] = {p.name: p for p in (BatteryPanel, BluetoothPanel)}
 
 
 class PanelApp:
@@ -725,6 +1052,9 @@ class PanelApp:
             d = msg.get("data", {})
             self.set_visible(d.get("panel") or "battery", bool(d.get("visible")))
             return
+        if "id" in msg and "ok" in msg:
+            for v in self.views.values():
+                v.on_reply(msg)
         data = msg.get("data")
         if isinstance(data, dict) and "series" in data and data.get("module"):
             for v in self.views.values():
