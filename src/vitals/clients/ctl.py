@@ -54,9 +54,9 @@ def cmd_status(_args) -> int:
 
 def cmd_panel(args) -> int:
     if args.action == "toggle":
-        r = _rpc("panel.toggle", panel="battery")
+        r = _rpc("panel.toggle", panel=args.name)
     else:
-        r = _rpc("panel.set", panel="battery", visible=(args.action == "show"))
+        r = _rpc("panel.set", panel=args.name, visible=(args.action == "show"))
     print(json.dumps(r))
     return 0 if r.get("ok") else 1
 
@@ -114,6 +114,8 @@ def main() -> int:
     sub.add_parser("status").set_defaults(fn=cmd_status)
     p = sub.add_parser("panel")
     p.add_argument("action", choices=["toggle", "show", "hide"])
+    p.add_argument("name", nargs="?", default="battery",
+                   help="panel name (default: battery)")
     p.set_defaults(fn=cmd_panel)
     pr = sub.add_parser("profile")
     pr.add_argument("name", help="'get' or a profile name")

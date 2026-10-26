@@ -1,9 +1,10 @@
 """vitals-panel — GTK3 + gtk-layer-shell dropdown panel (iStat-style).
 
-A single layer-shell surface anchored top-right. It is a thin client: all
-data comes from vitalsd over the JSON socket protocol; controls write
-through the daemon. Visibility is driven by `panel` events (toggled by
-`vitalsctl panel toggle` from the waybar module).
+One process hosts every panel: each is a layer-shell surface anchored
+top-right, created on first open, and at most one is visible. It is a thin
+client: all data comes from vitalsd over the JSON socket protocol; controls
+write through the daemon. Visibility is driven by `panel` events (toggled by
+`vitalsctl panel toggle [NAME]` from a waybar module).
 """
 from __future__ import annotations
 
@@ -224,18 +225,20 @@ class Graph(Gtk.DrawingArea):
             cr.stroke()
 
 
-class Panel:
-    def __init__(self):
-        self.cfg = _load_config()
-        pcfg = self.cfg["panel"]
+class BasePanel:
+    """One layer-shell dropdown window. Subclasses fill in the content and
+    react to daemon data; the window, anchoring and dismissal live here."""
+
+    name = ""
+    modules: tuple[str, ...] = ()       # daemon modules this panel renders
+    history_module: str | None = None   # history.get replies routed here
+
+    def __init__(self, app: "PanelApp"):
+        self.app = app
+        self.cfg = app.cfg
+        pcfg = app.cfg.panel(self.name)
         self.width = int(pcfg.get("width", 360))
-        self.range_key = pcfg.get("range_default", "6h")
-        if self.range_key not in RANGES:
-            self.range_key = "6h"
         self.visible = False
-        self._brightness_drag = False
-        self._setting = False
-        self._last_ui_update = 0.0
 
         self.win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         self.win.get_style_context().add_class("vitals-panel")
@@ -260,18 +263,112 @@ class Panel:
         self.win.connect("focus-in-event", self._on_focus_in)
         self.win.connect("focus-out-event", self._on_focus_out)
 
-        self._build_ui()
-        self._load_css()
-
-        self.dc = DaemonClient(on_message=self.on_msg,
-                               on_connected=self.on_connected,
-                               on_lost=self.on_daemon_lost)
-
-    # ------------------------------------------------------------------ UI
-    def _build_ui(self):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.win.add(root)
+        self.build(root)
 
+    # ------------------------------------------------------------- content
+    def build(self, root: Gtk.Box) -> None:
+        raise NotImplementedError
+
+    def on_data(self) -> None:
+        """Module data in app.cache changed for one of self.modules."""
+
+    def on_history(self, data: dict) -> None:
+        pass
+
+    def on_shown(self) -> None:
+        pass
+
+    def on_daemon_lost(self) -> None:
+        self.hide(notify_daemon=False)
+
+    def _sep(self):
+        s = Gtk.Box()
+        s.get_style_context().add_class("sep")
+        return s
+
+    def _lbl(self, text):
+        l = Gtk.Label(label=text)
+        l.get_style_context().add_class("label")
+        l.set_xalign(0)
+        return l
+
+    def _kv_grid(self):
+        g = Gtk.Grid(row_spacing=2, column_spacing=14)
+        g.get_style_context().add_class("section")
+        box = g
+        return g, box
+
+    def _close_button(self) -> Gtk.Button:
+        close = Gtk.Button(label="✕")
+        close.get_style_context().add_class("close")
+        close.connect("clicked", lambda *_a: self.hide())
+        return close
+
+    # --------------------------------------------------------- visibility
+    def show(self) -> None:
+        self.visible = True
+        self.win.show_all()
+        self.win.present()
+        self.on_shown()
+
+    def hide(self, notify_daemon: bool = True) -> None:
+        was = self.visible
+        self.visible = False
+        self._had_focus = False
+        self._cancel_hide()
+        self.win.hide()
+        if was and notify_daemon:
+            # keep daemon-side visibility in sync (single-click reopen)
+            self.app.dc.send({"v": 1, "id": "v1", "op": "panel.set",
+                              "panel": self.name, "visible": False})
+
+    def on_key(self, _w, event) -> bool:
+        if event.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        return False
+
+    def _cancel_hide(self) -> None:
+        if self._hide_timer:
+            GLib.source_remove(self._hide_timer)
+            self._hide_timer = 0
+
+    def _on_focus_in(self, *_a):
+        self._had_focus = True
+        self._cancel_hide()
+
+    def _on_focus_out(self, *_a):
+        # Grace period so the pointer can cross the gap between the bar and
+        # the panel (focus follows the mouse) without the panel vanishing.
+        if self.visible and self._had_focus and not self._hide_timer:
+            self._hide_timer = GLib.timeout_add(HIDE_DELAY_MS, self._hide_late)
+        return False
+
+    def _hide_late(self) -> bool:
+        self._hide_timer = 0
+        if self.visible:
+            self.hide()
+        return False
+
+
+class BatteryPanel(BasePanel):
+    name = "battery"
+    modules = ("battery", "power")
+    history_module = "battery"
+
+    def __init__(self, app: "PanelApp"):
+        pcfg = app.cfg.panel(self.name)
+        self.range_key = pcfg.get("range_default", "6h")
+        if self.range_key not in RANGES:
+            self.range_key = "6h"
+        self._brightness_drag = False
+        self._setting = False
+        super().__init__(app)
+
+    # ------------------------------------------------------------------ UI
+    def build(self, root: Gtk.Box) -> None:
         # -- header
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         head.get_style_context().add_class("section")
@@ -401,69 +498,23 @@ class Panel:
         self.lbl_updated = Gtk.Label(label="")
         self.lbl_updated.get_style_context().add_class("dim")
         foot.pack_start(self.lbl_updated, True, True, 0)
-        close = Gtk.Button(label="✕")
-        close.get_style_context().add_class("close")
-        close.connect("clicked", lambda *_a: self.hide())
-        foot.pack_end(close, False, False, 0)
+        foot.pack_end(self._close_button(), False, False, 0)
         root.pack_start(foot, False, False, 0)
 
-    def _sep(self):
-        s = Gtk.Box()
-        s.get_style_context().add_class("sep")
-        return s
+    # --------------------------------------------------------------- hooks
+    def on_data(self) -> None:
+        cache = self.app.cache
+        self.update(cache.get("battery", {}), cache.get("power", {}))
 
-    def _lbl(self, text):
-        l = Gtk.Label(label=text)
-        l.get_style_context().add_class("label")
-        l.set_xalign(0)
-        return l
+    def on_history(self, data: dict) -> None:
+        self.graph.set_series(data["series"], data.get("window_s", 3600))
 
-    def _kv_grid(self):
-        g = Gtk.Grid(row_spacing=2, column_spacing=14)
-        g.get_style_context().add_class("section")
-        box = g
-        return g, box
-
-    def _load_css(self):
-        provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
-        Gtk.StyleContext.add_provider_for_screen(
-            Gdk.Screen.get_default(), provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-
-    # ------------------------------------------------------------ protocol
-    def on_connected(self) -> None:
-        self.dc.send({"v": 1, "id": "p1", "op": "subscribe",
-                      "modules": ["battery", "power", "panel"]})
+    def on_shown(self) -> None:
         self._fetch_history()
 
     def on_daemon_lost(self) -> None:
-        self.win.hide()
-        self.visible = False
+        super().on_daemon_lost()
         self.lbl_state.set_text("daemon offline")
-
-    def on_msg(self, msg: dict) -> None:
-        if msg.get("event") == "panel":
-            vis = msg.get("data", {}).get("visible")
-            if vis:
-                self.show()
-            else:
-                self.hide()
-            return
-        if msg.get("ok") and isinstance(msg.get("panel"), dict):
-            # subscribe ack carries current daemon-side visibility
-            if msg["panel"].get("visible"):
-                self.show()
-            return
-        data = msg.get("data")
-        if not data:
-            return
-        if isinstance(data, dict) and data.get("module") == "battery" \
-                and "series" in data:
-            self.graph.set_series(data["series"], data.get("window_s", 3600))
-            return
-        if "battery" in data or "power" in data:
-            self.update(data.get("battery", {}), data.get("power", {}))
 
     # -------------------------------------------------------------- update
     def update(self, b: dict, p: dict) -> None:
@@ -574,7 +625,7 @@ class Panel:
 
     # ------------------------------------------------------------- actions
     def set_profile(self, name: str) -> None:
-        self.dc.send({"v": 1, "id": "x1", "op": "controls.set",
+        self.app.dc.send({"v": 1, "id": "x1", "op": "controls.set",
                       "control": "power.profile", "value": name})
 
     def on_brightness_changed(self, scale: Gtk.Scale) -> None:
@@ -592,7 +643,7 @@ class Panel:
         self._bright_timer = None
         if self._pending_bright is None:
             return False
-        self.dc.send({"v": 1, "id": "x2", "op": "controls.set",
+        self.app.dc.send({"v": 1, "id": "x2", "op": "controls.set",
                       "control": "display.brightness",
                       "value": self._pending_bright})
         self._pending_bright = None
@@ -614,60 +665,93 @@ class Panel:
         self._fetch_history()
 
     def _fetch_history(self) -> None:
-        self.dc.send({"v": 1, "id": "h1", "op": "history.get",
+        self.app.dc.send({"v": 1, "id": "h1", "op": "history.get",
                       "module": "battery",
                       "fields": ["percent", "power_w", "charging"],
                       "window_s": RANGES[self.range_key], "max_points": 360})
 
-    # --------------------------------------------------------- visibility
-    def show(self) -> None:
-        self.visible = True
-        self.win.show_all()
-        self.win.present()
-        self._fetch_history()
 
-    def hide(self, notify_daemon: bool = True) -> None:
-        was = self.visible
-        self.visible = False
-        self._had_focus = False
-        self._cancel_hide()
-        self.win.hide()
-        if was and notify_daemon:
-            # keep daemon-side visibility in sync (single-click reopen)
-            self.dc.send({"v": 1, "id": "v1", "op": "panel.set",
-                          "panel": "battery", "visible": False})
+PANELS: dict[str, type[BasePanel]] = {p.name: p for p in (BatteryPanel,)}
 
-    def on_key(self, _w, event) -> bool:
-        if event.keyval == Gdk.KEY_Escape:
-            self.hide()
-            return True
-        return False
 
-    def _cancel_hide(self) -> None:
-        if self._hide_timer:
-            GLib.source_remove(self._hide_timer)
-            self._hide_timer = 0
+class PanelApp:
+    """Owns the daemon connection and one lazily created window per panel;
+    at most one is visible, as the daemon decides."""
 
-    def _on_focus_in(self, *_a):
-        self._had_focus = True
-        self._cancel_hide()
+    def __init__(self):
+        self.cfg = _load_config()
+        self.views: dict[str, BasePanel] = {}
+        self.cache: dict[str, dict] = {}   # latest full state per module
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.dc = DaemonClient(on_message=self.on_msg,
+                               on_connected=self.on_connected,
+                               on_lost=self.on_daemon_lost)
 
-    def _on_focus_out(self, *_a):
-        # Grace period so the pointer can cross the gap between the bar and
-        # the panel (focus follows the mouse) without the panel vanishing.
-        if self.visible and self._had_focus and not self._hide_timer:
-            self._hide_timer = GLib.timeout_add(HIDE_DELAY_MS, self._hide_late)
-        return False
+    def view(self, name: str) -> BasePanel | None:
+        if name not in self.views and name in PANELS:
+            v = PANELS[name](self)
+            self.views[name] = v
+            if any(m in self.cache for m in v.modules):
+                v.on_data()
+        return self.views.get(name)
 
-    def _hide_late(self) -> bool:
-        self._hide_timer = 0
-        if self.visible:
-            self.hide()
-        return False
+    def set_visible(self, name: str, visible: bool) -> None:
+        if visible:
+            for other in self.views.values():
+                if other.name != name and other.visible:
+                    other.hide(notify_daemon=False)
+            v = self.view(name)
+            if v:
+                v.show()
+        elif name in self.views:
+            self.views[name].hide(notify_daemon=False)
+
+    # ------------------------------------------------------------ protocol
+    def on_connected(self) -> None:
+        mods = sorted({m for p in PANELS.values() for m in p.modules})
+        self.dc.send({"v": 1, "id": "p1", "op": "subscribe",
+                      "modules": mods + ["panel"]})
+
+    def on_daemon_lost(self) -> None:
+        for v in self.views.values():
+            v.on_daemon_lost()
+
+    def on_msg(self, msg: dict) -> None:
+        if msg.get("event") == "panel":
+            d = msg.get("data", {})
+            self.set_visible(d.get("panel") or "battery", bool(d.get("visible")))
+            return
+        data = msg.get("data")
+        if isinstance(data, dict) and "series" in data and data.get("module"):
+            for v in self.views.values():
+                if v.history_module == data["module"]:
+                    v.on_history(data)
+            return
+        if isinstance(data, dict):
+            self._apply_data(data)
+        if msg.get("ok") and isinstance(msg.get("panel"), dict):
+            # subscribe ack: its snapshot is cached above, then visibility
+            d = msg["panel"]
+            if d.get("visible"):
+                self.set_visible(d.get("panel") or "battery", True)
+
+    def _apply_data(self, data: dict) -> None:
+        known = {m for p in PANELS.values() for m in p.modules}
+        changed = {m for m, s in data.items()
+                   if m in known and isinstance(s, dict)}
+        for m in changed:
+            self.cache[m] = data[m]
+        for v in self.views.values():
+            if changed.intersection(v.modules):
+                v.on_data()
 
 
 def main() -> int:
-    Panel()  # wires itself to the daemon; starts hidden until a toggle event
+    PanelApp()  # wires itself to the daemon; windows open on panel events
     Gtk.main()
     return 0
 
