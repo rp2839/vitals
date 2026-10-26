@@ -558,3 +558,174 @@ The brief is authoritative for BAT0, AC and the existing Waybar setup. Those liv
 - Measure idle CPU, memory and wakeups with the panel hidden and visible.
 
 An initial performance target is less than 0.5% average of one CPU core with the panel hidden, no busy loops, and no more than one regular battery sampling wakeup every five seconds. Record actual daemon, bridge and panel RSS separately; these are acceptance targets, not measured claims.
+## 10. Bluetooth module
+
+Product behaviour is in SPEC §8, and the tracking issue is #26. Facts checked on the target machine (2026-10-26):
+- BlueZ 5.87 is active on the system bus, with a single adapter `hci0`.
+- The M585/M590 mouse exposes `org.bluez.Battery1`.
+- obexd is running on the session bus as `org.bluez.obex`.
+- `pactl` and `wpctl` are present.
+- blueman 2.4.6 is installed, but `blueman-applet` is not running, so **no pairing agent is currently registered**.
+- The BlueZ D-Bus policy (`/usr/share/dbus-1/system.d/bluetooth.conf`) allows any local user to call `org.bluez`.
+- The waybar config uses the built-in `bluetooth` module, with `on-click: blueman-manager`.
+
+### 10.1 Prerequisite: more than one module and panel
+
+The current code assumes a single module everywhere:
+- The daemon's `module_data`, `_flush_updates` and `_history_get` default to and filter on `("battery", "power")`.
+- `panel.toggle` and `panel.set` ignore the `panel` field and always report `"battery"`.
+- `vitals-panel` builds a single battery window.
+
+This has to land as a separate PR before any Bluetooth code:
+
+1. **Module registry in the daemon.** Each module registers a name, a `data()` callback and its control and action providers. Snapshot, subscribe and flush iterate over the registry instead of a literal tuple. Battery and power become the first two entries.
+2. **Panel visibility keyed by name.** The daemon tracks `visible_panel: str | None`, and only one panel is open at a time. `panel.toggle {"panel":"bluetooth"}` opening Bluetooth closes Battery. The `panel` event carries the name.
+3. **One `vitals-panel` process with one layer-shell window per panel.** Each window is created lazily on its first open and then kept, hidden. Shared pieces move into the base: `DaemonClient`, CSS, anchoring, focus-out grace and Esc handling. The battery content becomes `BatteryView` and the new content is `BluetoothView`. A second GTK process per panel would double resident memory for no isolation benefit.
+4. **Per-panel anchor margin in config.** `[panel.bluetooth] margin_right = …`. As §1 explains, layer-shell cannot locate a waybar module, so each indicator's offset is configured.
+5. **The bar bridge already takes a module argument** (`vitals-bar battery`). It gains `bluetooth`, and its formatter moves behind the same registry.
+
+### 10.2 Acquisition: BlueZ over the system bus
+
+All BlueZ access goes through one `BluezBackend` class in `vitals/linux/bluez.py`, so collectors, controls and tests never touch Gio directly. It uses Gio asynchronous D-Bus only.
+
+- On start, call `org.freedesktop.DBus.ObjectManager.GetManagedObjects` on `org.bluez` at `/`.
+- From then on, keep the model current from `InterfacesAdded`, `InterfacesRemoved` and `PropertiesChanged`, subscribed once with a sender filter on `org.bluez`. There is no polling.
+- Watch the name owner of `org.bluez`. When `bluetoothd` restarts, mark the module `unavailable`, then re-run `GetManagedObjects` when the name reappears.
+- The model holds:
+  - **Adapter** (`Adapter1`): `Address`, `Alias`, `Powered`, `PowerState`, `Discovering`, `Pairable`, `Discoverable`.
+  - **Device** (`Device1`): `Address`, `Alias`, `Icon`, `Paired`, `Bonded`, `Trusted`, `Blocked`, `Connected`, `RSSI`, `UUIDs`.
+  - **Battery** (`Battery1`): `Percentage`, `Source`.
+- **rfkill.** Read `/sys/class/rfkill/rfkill*/{type,soft,hard}` for `type == bluetooth`, and watch it through the existing uevent netlink socket (`rfkill` subsystem). `Adapter1.PowerState` reports `off-blocked` for a soft block, but the hard-block distinction needs sysfs.
+- **Last connected.** BlueZ doesn't expose a last-connected time. The daemon records the time of `Connected → true` transitions in `$XDG_STATE_HOME/vitals/bluetooth.json`, keyed by address, and uses it for sorting (SPEC 8.2.3).
+
+Snapshot shape (abbreviated):
+
+```json
+{"bluetooth":{"available":true,"adapter":{"address":"38:8D:3D:89:67:A7","alias":"fedora","powered":true,"power_state":"on","rfkill":"none","discovering":false},"devices":[{"address":"D3:3B:0A:10:24:0D","alias":"M585/M590","icon":"input-mouse","paired":true,"trusted":true,"blocked":false,"connected":true,"battery":41,"rssi":null,"audio":false,"opp":false,"busy":null,"last_connected":"2026-10-26T08:12:03Z"}],"transfer":null,"prompt":null}}
+```
+
+`busy` is `null`, `"connecting"`, `"disconnecting"`, `"pairing"` or `"removing"`. Every view renders spinners and insensitive buttons from this one field, so the bar, a re-opened panel and a reconnecting panel all agree.
+
+Discovered, unpaired devices are only included while discovery is running, and are capped at 64 by RSSI. BlueZ removes stale ones about 30 s after discovery stops.
+
+### 10.3 Actions: a new protocol operation
+
+`controls.set` sets one scalar value, which suits adapter power. Most Bluetooth operations instead target a device, take seconds, and may need a pairing prompt. They use a new allowlisted `action` operation:
+
+```json
+{"v":1,"id":"r9","op":"action","action":"bluetooth.connect","args":{"device":"D3:3B:0A:10:24:0D"}}
+```
+
+| Action | Backend call | Timeout |
+|---|---|---|
+| `bluetooth.connect` / `disconnect` | `Device1.Connect` / `Disconnect` | 30 s / 10 s |
+| `bluetooth.pair` | `Device1.Pair`, then `Trusted=true`, then `Connect` | 60 s (prompts included) |
+| `bluetooth.cancel_pair` | `Device1.CancelPairing` | 5 s |
+| `bluetooth.forget` | `Adapter1.RemoveDevice(path)` | 10 s |
+| `bluetooth.set_trusted` / `set_blocked` / `rename` | `Properties.Set` on `Trusted` / `Blocked` / `Alias` | 5 s |
+| `bluetooth.discovery` `{"on":bool}` | `SetDiscoveryFilter({"Transport":"auto"})`, `Pairable=true`, then `StartDiscovery` / `StopDiscovery` | 5 s |
+| `bluetooth.audio_profile` `{"profile":…}` | §10.6 | 5 s |
+| `bluetooth.send_file` `{"path":…}` / `cancel_transfer` | §10.8 | n/a |
+
+Adapter power is a control, `bluetooth.power` (boolean), set through `Adapter1.Powered`. When the adapter is soft-blocked, the daemon first unblocks it by writing an `RFKILL_OP_CHANGE` event (`struct rfkill_event`, type `RFKILL_TYPE_BLUETOOTH`, `soft=0`) to `/dev/rfkill`. This is what `rfkill unblock bluetooth` does. The sysfs `soft` attribute is root-only (`-rw-r--r-- root`), but `/dev/rfkill` carries an ACL (`crw-rw-r--+`), which is presumably the systemd-logind uaccess grant for the active session. Verify this on the target (see §10.10). If the write is denied, the panel reports that the adapter is blocked and offers **Open blueman**. Vitals does not use blueman's polkit rfkill helper.
+
+Rules:
+- **Device arguments.** `device` must be a MAC address that is already in the model. The daemon maps it to the object path itself, so clients never send D-Bus paths.
+- **One operation per device.** A second action on a busy device fails with `busy`.
+- **Error codes.** BlueZ errors map to stable codes in the reply: `org.bluez.Error.AuthenticationFailed` → `auth_failed`, `…Failed: Host is down` → `unreachable`, `…AlreadyConnected` → success, and `…InProgress` → `busy`.
+- **Discovery ownership.** Discovery is tied to the client that started it. If that panel connection drops, or the daemon receives `panel.set visible=false` for Bluetooth, the daemon stops discovery and sets `Pairable` back to its previous value. A 60 s daemon-side timer stops it even if the client forgets.
+
+`vitalsctl` gains `bluetooth power toggle|on|off` (used by the right-click) and `bluetooth connect|disconnect <mac>` for scripting.
+
+### 10.4 Agent placement
+
+The pairing agent lives in the **daemon**, not the panel. A device can start pairing at any time, including when no panel is open. The agent also has to survive panel restarts, and the daemon already owns the system-bus connection.
+
+### 10.5 Pairing agent
+
+- Export `org.bluez.Agent1` at `/org/vitals/agent`.
+- Register it with `AgentManager1.RegisterAgent(path, "KeyboardDisplay")`, then call `RequestDefaultAgent`. `KeyboardDisplay` lets BlueZ choose the best association model for each device.
+- Register again whenever the `org.bluez` name reappears.
+- Agent method calls are handled asynchronously. The daemon keeps the `Gio.DBusMethodInvocation`, emits a `prompt` event, and returns from the method call without replying yet:
+
+```json
+{"v":1,"event":"prompt","data":{"id":"p3","kind":"confirm_passkey","device":"AA:BB:…","alias":"WH-1000XM5","passkey":"123456"}}
+```
+
+- The panel answers with `{"op":"prompt.reply","id":"p3","accept":true,"value":null}`. The daemon then returns the stored invocation, or `org.bluez.Error.Rejected` / `Canceled`.
+- If nobody answers within 30 s, the daemon replies `Rejected` itself. BlueZ's `Cancel()` clears the prompt.
+- Only one prompt can be outstanding at a time. A second one is rejected, which BlueZ does not do in practice.
+
+| Agent1 method | `kind` | Reply value |
+|---|---|---|
+| `RequestConfirmation` | `confirm_passkey` | none |
+| `RequestPinCode` / `RequestPasskey` | `enter_pin` / `enter_passkey` | string (1–16 chars) / uint32 (0–999999), validated by the daemon |
+| `DisplayPinCode` / `DisplayPasskey` | `display_pin` / `display_passkey` | none, replied immediately; `entered` updates the prompt |
+| `RequestAuthorization` | `authorize_pairing` | none |
+| `AuthorizeService` | `authorize_service` | auto-accept when the device is `Trusted`, otherwise prompt |
+
+- **Prompt while the panel is closed.** The daemon sets the Bluetooth panel visible (which opens it) and sends the SPEC 8.3 notification.
+- **Prompt with no panel connected.** If no panel process is connected at all, the daemon rejects the request instead of leaving the device waiting.
+
+**Coexistence.** BlueZ has a single default agent, and whichever process requests it last wins. `/etc/xdg/autostart/blueman.desktop` exists, and Hyprland does not run XDG autostart today. The README should still say to disable `blueman-applet` if it is ever started (a `Hidden=true` override in `~/.config/autostart/`). **Open blueman** in the footer launches only the manager, and the manager registers no agent.
+
+### 10.6 Audio profile switching
+
+Audio cards are owned by PipeWire, not BlueZ. Profile switching sits behind an `AudioProfiles` boundary in `vitals/linux/pipewire.py` that the later Audio module (#13) takes over:
+
+- Find the card named `bluez_card.<MAC with underscores>` with `pactl --format=json list cards`. This works through pipewire-pulse, which is present. The list gives the available profiles and the active one.
+- Map profile names to display labels:
+  - `a2dp-sink*` → **Hi-Fi (A2DP)**
+  - `headset-head-unit*` → **Headset (HFP)**
+  - `off` → **Off**
+  - Any other profile is listed under its PipeWire description.
+- Switch with `pactl set-card-profile <card> <profile>`, run with Gio.Subprocess and an argument vector.
+- Refresh the card list when an audio device connects, when the panel opens, and after a switch. There is no `pactl subscribe` while the panel is hidden, which keeps the idle cost at zero.
+
+A device counts as audio when its `UUIDs` contain Audio Sink (`0000110b…`) or Handsfree / Headset (`0000111e…`, `00001108…`).
+
+### 10.7 Panel focus holds
+
+The 0.5 s focus-out grace (#24) closes the panel whenever focus leaves it. A pairing prompt, the file chooser and the forget confirmation all need focus to stay put. `BasePanel` therefore keeps a hold counter:
+- `hold()` cancels any pending hide and suppresses focus-out dismissal.
+- `release()` re-arms dismissal. If the panel no longer has focus when the last hold is released, the normal 0.5 s timer starts.
+- Esc and the indicator click still close the panel during a hold. Closing it cancels the outstanding prompt, which the daemon then rejects.
+
+**File chooser.** Use `Gtk.FileChooserNative`, so the xdg-desktop-portal chooser is used where one exists. Its window is a normal toplevel and will be tiled by Hyprland. That is acceptable for a short-lived dialog, and it is the only place this module creates a normal window. The panel holds focus for the dialog's lifetime.
+
+### 10.8 Sending files (OBEX)
+
+- obexd runs on the **session** bus, and the daemon is a user service, so it can call obexd directly.
+- `org.bluez.obex.Client1.CreateSession(mac, {"Target": "opp"})`, then `ObjectPush1.SendFile(path)`. The call returns a `Transfer1` object.
+- Watch that object's `Status`, `Transferred` and `Size` through `PropertiesChanged`, and publish them as the module's `transfer` field.
+- Cancel calls `Transfer1.Cancel`. Remove the session when the transfer completes or fails.
+- The path comes from the panel's file chooser. The daemon accepts only absolute paths to regular files that the user can read, and never follows anything else from the client.
+- Only one transfer runs at a time.
+- A device offers Send file when its `UUIDs` include OBEX Object Push (`00001105…`).
+
+### 10.9 Resource use
+
+- With the panel hidden, the cost is one D-Bus match rule set, the rfkill uevent and the agent object. There are no timers.
+- `RSSI` changes arrive only during discovery, and discovery only runs while the Add device section is open.
+- **Battery levels.** BlueZ refreshes `Battery1` (GATT Battery Service) when the device notifies. Vitals does not poll devices, so some peripherals may only report a new level on reconnect.
+
+### 10.10 Testing
+
+**Automated tests**
+- `BluezBackend` is the seam. Tests use a `FakeBluez` that holds an object tree dict and emits the same callbacks.
+- Fixtures cover:
+  - Adapter missing, powered off, and soft and hard rfkill.
+  - Devices with and without `Battery1`.
+  - `bluetoothd` restarts (name owner lost and regained).
+  - A device removed while busy.
+  - Every BlueZ error-to-code mapping.
+- Agent tests drive each `Agent1` method with a fake invocation. They check event emission, the reply value, the 30 s timeout (injected clock), `Cancel()`, prompts arriving while the panel is closed, and the no-panel rejection.
+- Action tests check MAC validation, the per-device `busy` guard, and discovery ownership: discovery stops when the client disconnects or the panel closes, and on the 60 s timer.
+- `AudioProfiles` and OBEX tests use a fake subprocess and a fake obex bus. They check profile mapping from recorded `pactl --format=json list cards` output.
+- No test may change the real adapter, pairings or audio profile.
+
+**Manual acceptance on the target machine**
+- Run through every criterion in SPEC 8.5.
+- Pair one device of each type available: the mouse (Just Works), headphones (A2DP and HFP switching), and a phone (passkey confirmation and an OBEX send).
+- Restart `bluetooth.service` with the panel open, and check that the panel recovers and the agent re-registers (`busctl --system tree org.bluez` and a fresh pairing).
+- Check that the `/dev/rfkill` unblock works from the user service. Run `getfacl /dev/rfkill`; it printed nothing when this design was written, so the ACL holder is unconfirmed. If the write is denied, record the failure here and fall back as described in §10.3.
