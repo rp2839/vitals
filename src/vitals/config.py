@@ -31,6 +31,11 @@ DEFAULTS = {
     "brightness": {
         "device": "auto",          # "auto" or a brightnessctl device name
     },
+    "bluetooth": {
+        "low_battery_percent": 15,     # device battery warning (SPEC §8.1)
+        "show_battery": False,         # always show lowest device battery
+        "hide_when_no_adapter": False,
+    },
     "history": {
         "persist": False,
     },
@@ -61,6 +66,10 @@ class Config:
 
     def get(self, section: str, key: str, default=None):
         return self._d.get(section, {}).get(key, default)
+
+    def get_section(self, section: str) -> dict | None:
+        s = self._d.get(section)
+        return s if isinstance(s, dict) else None
 
     def panel(self, name: str) -> dict:
         """[panel] scalars overlaid with the [panel.<name>] table, if any."""

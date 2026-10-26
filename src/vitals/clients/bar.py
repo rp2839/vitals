@@ -12,6 +12,9 @@ import socket
 import sys
 import time
 
+from .. import config as config_mod
+from ..collectors.bluetooth import classify as bt_classify
+
 SOCK_ENV = "VITALS_SOCKET"
 
 # Nerd Font (material) glyphs — codepoints verified against the literals in
@@ -140,18 +143,78 @@ def _unknown(msg: str) -> dict:
             "percentage": 0}
 
 
-def render_battery(state: dict) -> dict:
+def render_battery(state: dict, _cfg=None) -> dict:
     return render(state.get("battery", {}), state.get("power", {}))
 
 
-# bar module name -> (daemon modules it subscribes to, renderer over them)
+# Bluetooth glyphs (Nerd Font material): bluetooth, -audio, -connect, -off,
+# -transfer = U+F00AF..U+F00B4 (SPEC §8.1)
+BT_ON = chr(0xF00AF)
+BT_AUDIO = chr(0xF00B0)
+BT_CONNECTED = chr(0xF00B1)
+BT_OFF = chr(0xF00B2)
+_BT_ASCII = {"on": "BT", "connected": "BT+", "off": "BT-", "blocked": "BT-",
+             "noadapter": "BT-", "unknown": "BT?"}
+
+
+def render_bluetooth(state: dict, cfg: dict | None = None) -> dict:
+    """SPEC §8.1 indicator. cfg: the [bluetooth] config section."""
+    cfg = cfg if cfg is not None else config_mod.DEFAULTS["bluetooth"]
+    bt = state.get("bluetooth") or {}
+    low = int(cfg.get("low_battery_percent", 15))
+    st, classes = bt_classify(bt, low)
+    connected = [d for d in bt.get("devices") or [] if d.get("connected")]
+    if os.environ.get("VITALS_ASCII"):
+        icon = _BT_ASCII.get(st, "BT?")
+    elif st == "connected":
+        icon = BT_AUDIO if "audio" in classes else BT_CONNECTED
+    elif st == "on":
+        icon = BT_ON
+    else:
+        icon = BT_OFF
+    parts = [icon]
+    if st == "blocked":
+        parts.append("blocked")
+    elif st == "unknown":
+        parts.append("--")
+    if len(connected) >= 2:
+        parts.append(str(len(connected)))
+    levels = [d["battery"] for d in connected if d.get("battery") is not None]
+    if levels and (cfg.get("show_battery") or "lowbattery" in classes):
+        parts.append(f"· {min(levels)}%")
+    text = " ".join(parts)
+    if st == "noadapter" and cfg.get("hide_when_no_adapter"):
+        text = ""
+
+    ad = bt.get("adapter") or {}
+    head = {"on": "On", "connected": "On", "off": "Off",
+            "blocked": "Blocked by hardware switch", "noadapter": "No adapter",
+            "unknown": "Bluetooth unavailable"}[st]
+    lines = [f"{ad['alias']} · {head}" if ad.get("alias") else f"Bluetooth · {head}"]
+    for d in connected:
+        bat = f" · {d['battery']}%" if d.get("battery") is not None else ""
+        lines.append(f"{d.get('alias')}{bat}")
+    return {"text": text, "tooltip": "\n".join(lines), "class": classes,
+            "alt": st, "percentage": min(levels) if levels else 0}
+
+
+def _unknown_bluetooth(msg: str) -> dict:
+    out = render_bluetooth({})
+    out["tooltip"] = msg
+    return out
+
+
+# bar module name -> (daemon modules it subscribes to, renderer taking
+# (state, config section or None), output while the daemon is unreachable)
 MODULES = {
-    "battery": (("battery", "power"), render_battery),
+    "battery": (("battery", "power"), render_battery, lambda m: _unknown(m)),
+    "bluetooth": (("bluetooth",), render_bluetooth, _unknown_bluetooth),
 }
 
 
-def session(sock: socket.socket, module: str = "battery") -> None:
-    mods, render_fn = MODULES[module]
+def session(sock: socket.socket, module: str = "battery",
+            cfg: dict | None = None) -> None:
+    mods, render_fn, _ = MODULES[module]
     buf = b""
     sock.sendall(json.dumps({"v": 1, "id": "s1", "op": "subscribe",
                              "modules": list(mods)}).encode() + b"\n")
@@ -175,7 +238,7 @@ def session(sock: socket.socket, module: str = "battery") -> None:
                 if m in data_part:
                     state[m].update(data_part[m])
             if msg.get("ok") or msg.get("event") == "update":
-                out = render_fn(state)
+                out = render_fn(state, cfg)
                 js = json.dumps(out, separators=(",", ":"))
                 if js != last_line:
                     last_line = js
@@ -189,21 +252,23 @@ def main() -> int:
         print(f"vitals-bar: unknown module {module!r} "
               f"(known: {', '.join(MODULES)})", file=sys.stderr)
         return 2
+    unknown = MODULES[module][2]
+    cfg = config_mod.load().get_section(module)
     backoff = 1.0
     while True:
         try:
             sock = connect()
             backoff = 1.0
             try:
-                session(sock, module)
+                session(sock, module, cfg)
             finally:
                 try:
                     sock.close()
                 except OSError:
                     pass
-            _emit(_unknown("vitalsd: connection lost"))
+            _emit(unknown("vitalsd: connection lost"))
         except OSError:
-            _emit(_unknown("vitalsd: not running"))
+            _emit(unknown("vitalsd: not running"))
         time.sleep(backoff)
         backoff = min(backoff * 2, 10.0)
 

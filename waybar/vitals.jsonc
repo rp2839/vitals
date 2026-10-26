@@ -14,5 +14,16 @@
     "on-scroll-up": "~/.local/bin/vitalsctl brightness +5",
     "on-scroll-down": "~/.local/bin/vitalsctl brightness -5",
     "tooltip": true
+  },
+  // Replaces waybar's built-in "bluetooth" module; add
+  // "custom/vitals-bluetooth" to modules-right. Left click will open the
+  // Bluetooth panel once it lands; right click toggles adapter power.
+  "custom/vitals-bluetooth": {
+    "exec": "~/.local/bin/vitals-bar bluetooth",
+    "return-type": "json",
+    "restart-interval": 3,
+    "exec-on-event": false,
+    "on-click-right": "~/.local/bin/vitalsctl bluetooth power toggle",
+    "tooltip": true
   }
 }

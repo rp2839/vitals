@@ -10,9 +10,9 @@ import sys
 from .bar import connect, fmt_time
 
 
-def _rpc(op: str, **kw) -> dict:
+def _rpc(op: str, timeout: float = 10.0, **kw) -> dict:
     sock = connect()
-    sock.settimeout(10.0)
+    sock.settimeout(timeout)
     try:
         req = {"v": 1, "id": "c1", "op": op}
         req.update(kw)
@@ -108,6 +108,29 @@ def cmd_brightness(args) -> int:
     return 0 if r.get("ok") else 1
 
 
+def cmd_bluetooth(args) -> int:
+    if args.verb == "power":
+        want = args.arg
+        if want == "toggle":
+            r = _rpc("controls.get")
+            want = "off" if r["data"]["bluetooth.power"]["value"] else "on"
+        if want not in ("on", "off"):
+            print("vitalsctl: bluetooth power on|off|toggle", file=sys.stderr)
+            return 2
+        r = _rpc("controls.set", timeout=10.0, control="bluetooth.power",
+                 value=(want == "on"))
+    else:
+        if not args.arg:
+            print(f"vitalsctl: bluetooth {args.verb} <MAC>", file=sys.stderr)
+            return 2
+        r = _rpc("action", timeout=35.0, action=f"bluetooth.{args.verb}",
+                 args={"device": args.arg})
+    if not r.get("ok"):
+        print(f"vitalsctl: {r.get('error', {}).get('message')}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="vitalsctl")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -123,6 +146,10 @@ def main() -> int:
     br = sub.add_parser("brightness")
     br.add_argument("value", help="'get' or a percent 1-100")
     br.set_defaults(fn=cmd_brightness)
+    bt = sub.add_parser("bluetooth")
+    bt.add_argument("verb", choices=["power", "connect", "disconnect"])
+    bt.add_argument("arg", nargs="?", help="on|off|toggle, or a device MAC")
+    bt.set_defaults(fn=cmd_bluetooth)
     args = ap.parse_args()
     try:
         return args.fn(args)

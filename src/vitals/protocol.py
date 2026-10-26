@@ -9,7 +9,8 @@ MAX_FRAME = 64 * 1024
 ERROR_CODES = {
     "invalid_request", "unsupported_version", "unknown_control",
     "invalid_value", "unavailable", "permission_denied", "timeout",
-    "internal",
+    "internal", "unknown_action", "busy", "unreachable", "auth_failed",
+    "profile_unavailable", "blocked",
 }
 
 
