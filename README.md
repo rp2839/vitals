@@ -25,7 +25,7 @@ sysfs / inotify / D-Bus (power-profiles-daemon) / brightnessctl
 - `vitalsd` — the daemon: collectors, history, controls, notifications.
 - `vitals-bar` — waybar `custom/` module bridge (streams one JSON object per line).
 - `vitals-panel` — layer-shell dropdown (anchored top-right, autohide, Esc closes).
-- `vitalsctl` — CLI: `status`, `panel toggle`, `profile <name|get|cycle>`, `brightness <N|get|+5|-5>`.
+- `vitalsctl` — CLI: `status`, `panel toggle|show|hide [NAME]` (default `battery`), `profile <name|get|cycle>`, `brightness <N|get|+5|-5>`.
 
 Docs: [product spec](docs/SPEC.md) · [technical design](docs/DESIGN.md) ·
 [contrib workflow](docs/WORKFLOW.md)
@@ -63,6 +63,9 @@ critical_percent = 10
 [panel]
 margin_top = 38      # clears waybar
 range_default = "6h"
+
+[panel.battery]      # optional per-panel overrides of the [panel] keys
+margin_right = 8
 
 [notifications]
 low = true

@@ -140,12 +140,23 @@ def _unknown(msg: str) -> dict:
             "percentage": 0}
 
 
-def session(sock: socket.socket) -> None:
+def render_battery(state: dict) -> dict:
+    return render(state.get("battery", {}), state.get("power", {}))
+
+
+# bar module name -> (daemon modules it subscribes to, renderer over them)
+MODULES = {
+    "battery": (("battery", "power"), render_battery),
+}
+
+
+def session(sock: socket.socket, module: str = "battery") -> None:
+    mods, render_fn = MODULES[module]
     buf = b""
     sock.sendall(json.dumps({"v": 1, "id": "s1", "op": "subscribe",
-                             "modules": ["battery", "power"]}).encode() + b"\n")
+                             "modules": list(mods)}).encode() + b"\n")
     last_line = None
-    battery, power = {}, {}
+    state: dict[str, dict] = {m: {} for m in mods}
     while True:
         data = sock.recv(8192)
         if not data:
@@ -160,12 +171,11 @@ def session(sock: socket.socket) -> None:
             except json.JSONDecodeError:
                 continue
             data_part = msg.get("data") or {}
-            if "battery" in data_part:
-                battery.update(data_part["battery"])
-            if "power" in data_part:
-                power.update(data_part["power"])
+            for m in mods:
+                if m in data_part:
+                    state[m].update(data_part[m])
             if msg.get("ok") or msg.get("event") == "update":
-                out = render(battery, power)
+                out = render_fn(state)
                 js = json.dumps(out, separators=(",", ":"))
                 if js != last_line:
                     last_line = js
@@ -174,13 +184,18 @@ def session(sock: socket.socket) -> None:
 
 
 def main() -> int:
+    module = sys.argv[1] if len(sys.argv) > 1 else "battery"
+    if module not in MODULES:
+        print(f"vitals-bar: unknown module {module!r} "
+              f"(known: {', '.join(MODULES)})", file=sys.stderr)
+        return 2
     backoff = 1.0
     while True:
         try:
             sock = connect()
             backoff = 1.0
             try:
-                session(sock)
+                session(sock, module)
             finally:
                 try:
                     sock.close()

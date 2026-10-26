@@ -15,6 +15,7 @@ DEFAULTS = {
         "power_floor_w": 0.5,      # below this, time estimates are suppressed
     },
     "panel": {
+        # shared defaults; a [panel.<name>] table overrides them per panel
         "margin_top": 38,          # clears waybar
         "margin_right": 8,
         "width": 360,
@@ -60,6 +61,15 @@ class Config:
 
     def get(self, section: str, key: str, default=None):
         return self._d.get(section, {}).get(key, default)
+
+    def panel(self, name: str) -> dict:
+        """[panel] scalars overlaid with the [panel.<name>] table, if any."""
+        base = self._d.get("panel", {})
+        out = {k: v for k, v in base.items() if not isinstance(v, dict)}
+        own = base.get(name)
+        if isinstance(own, dict):
+            out.update(own)
+        return out
 
 
 def load(path: Path | None = None) -> Config:

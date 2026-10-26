@@ -14,6 +14,7 @@ import struct
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 from gi.repository import GLib, Gio
 
@@ -161,7 +162,12 @@ class Daemon:
             cfg["notifications"], cfg["battery"])
         self.clients: set[Client] = set()
         self.battery_state: dict = {}
-        self.panel_visible = False
+        # module name -> callable returning that module's full current state
+        self.modules: dict[str, Callable[[], dict]] = {}
+        self.histories: dict[str, History] = {}
+        # panel names the daemon accepts; at most one is visible at a time
+        self.panels: set[str] = set()
+        self.visible_panel: str | None = None
         self.seq = 0
         self._sample_handle = None
         self._sample_pending = False
@@ -183,6 +189,25 @@ class Daemon:
         # power-source tracking for panel rows (SPEC §3.4)
         self._last_ac: bool | None = None
         self._ac_since = time.time()
+
+        self.register_module("battery", self._battery_data, history=self.history)
+        self.register_module("power", self._power_data)
+        self.register_panel("battery")
+
+    # ------------------------------------------------------------- registry
+    def register_module(self, name: str, data: Callable[[], dict],
+                        history: History | None = None) -> None:
+        self.modules[name] = data
+        if history is not None:
+            self.histories[name] = history
+
+    def register_panel(self, name: str) -> None:
+        self.panels.add(name)
+
+    @property
+    def panel_visible(self) -> bool:
+        """True while the battery panel is open (drives battery sampling)."""
+        return self.visible_panel == "battery"
 
     # ------------------------------------------------------------- lifecycle
     def start(self, loop) -> int:
@@ -362,29 +387,32 @@ class Daemon:
             self._bright_cache_ts = now
         return self._bright_cache
 
+    def _battery_data(self) -> dict:
+        b = dict(self.battery_state)
+        b["on_source_s"] = int(time.time() - self._ac_since)
+        avg = self.history.series(["power_w"], 600, max_points=120)
+        vals = [v for _, v in avg.get("power_w", []) if v is not None]
+        b["avg_power_10m_w"] = round(sum(vals) / len(vals), 1) if vals else None
+        return b
+
+    def _power_data(self) -> dict:
+        ps = self.profiles.state()
+        bs = self._brightness_state()
+        return {
+            "active_profile": ps["active_profile"],
+            "profiles": ps["profiles"],
+            "hold": ps["hold"],
+            "profile_available": ps["available"],
+            "brightness_percent": bs["value"],
+            "brightness_available": bs["available"],
+            "brightness_device": bs["device"],
+        }
+
     def module_data(self, modules: list[str] | None = None) -> dict:
-        data = {}
-        mods = modules or ["battery", "power"]
-        if "battery" in mods:
-            b = dict(self.battery_state)
-            b["on_source_s"] = int(time.time() - self._ac_since)
-            avg = self.history.series(["power_w"], 600, max_points=120)
-            vals = [v for _, v in avg.get("power_w", []) if v is not None]
-            b["avg_power_10m_w"] = round(sum(vals) / len(vals), 1) if vals else None
-            data["battery"] = b
-        if "power" in mods:
-            ps = self.profiles.state()
-            bs = self._brightness_state()
-            data["power"] = {
-                "active_profile": ps["active_profile"],
-                "profiles": ps["profiles"],
-                "hold": ps["hold"],
-                "profile_available": ps["available"],
-                "brightness_percent": bs["value"],
-                "brightness_available": bs["available"],
-                "brightness_device": bs["device"],
-            }
-        return data
+        """State for the requested registered modules (all when None);
+        unknown names are ignored."""
+        names = self.modules if modules is None else modules
+        return {m: self.modules[m]() for m in names if m in self.modules}
 
     def _flush_updates(self) -> bool:
         if not self._dirty:
@@ -392,7 +420,7 @@ class Daemon:
         now = time.monotonic()
         keep_dirty = False
         for c in list(self.clients):
-            mods = [m for m in ("battery", "power") if m in c.subscribed]
+            mods = [m for m in self.modules if m in c.subscribed]
             if not mods:
                 continue
             if now - c.sub_since < 0.5:
@@ -413,7 +441,7 @@ class Daemon:
             c.send(protocol.reply(rid, True, seq=self.seq,
                                   data=self.module_data(req.get("modules"))))
         elif op == "subscribe":
-            mods = req.get("modules") or ["battery", "power"]
+            mods = req.get("modules") or list(self.modules)
             if not isinstance(mods, list):
                 c.send(protocol.error_reply(rid, "invalid_request",
                                             "modules must be a list"))
@@ -423,30 +451,30 @@ class Daemon:
             self.seq += 1
             c.send(protocol.reply(rid, True, seq=self.seq,
                                   data=self.module_data(
-                                      [m for m in c.subscribed if m in ("battery", "power")]),
-                                  panel={"visible": self.panel_visible}))
+                                      [m for m in self.modules if m in c.subscribed]),
+                                  panel={"panel": self.visible_panel,
+                                         "visible": self.visible_panel is not None}))
         elif op == "controls.get":
             c.send(protocol.reply(rid, True, data=self._controls_get()))
         elif op == "controls.set":
             self._controls_set(c, rid, req)
         elif op == "history.get":
             self._history_get(c, rid, req)
-        elif op == "panel.toggle":
-            self.panel_visible = not self.panel_visible
-            self._broadcast_panel()
-            self._schedule_sample()
-            c.send(protocol.reply(rid, True, data={"panel": "battery",
-                                                   "visible": self.panel_visible}))
-        elif op == "panel.set":
-            vis = bool(req.get("visible"))
-            if vis != self.panel_visible:
-                self.panel_visible = vis
-                self._broadcast_panel()
-                self._schedule_sample()
-            if vis:
-                self._brightness_state(force=True)
-            c.send(protocol.reply(rid, True, data={"panel": "battery",
-                                                   "visible": self.panel_visible}))
+        elif op in ("panel.toggle", "panel.set"):
+            name = req.get("panel", "battery")
+            if not isinstance(name, str) or name not in self.panels:
+                c.send(protocol.error_reply(rid, "invalid_value",
+                                            f"unknown panel {name!r}"))
+                return
+            if op == "panel.toggle":
+                vis = self.visible_panel != name
+            else:
+                vis = bool(req.get("visible"))
+            self._set_visible_panel(name if vis else
+                                    (None if self.visible_panel == name
+                                     else self.visible_panel))
+            c.send(protocol.reply(rid, True, data={
+                "panel": name, "visible": self.visible_panel == name}))
         else:
             c.send(protocol.error_reply(rid, "invalid_request",
                                         f"unknown op {op!r}"))
@@ -498,7 +526,8 @@ class Daemon:
 
     def _history_get(self, c: Client, rid, req: dict) -> None:
         module = req.get("module", "battery")
-        if module != "battery":
+        history = self.histories.get(module)
+        if history is None:
             c.send(protocol.error_reply(rid, "unavailable",
                                         f"no history for {module!r}"))
             return
@@ -518,17 +547,31 @@ class Daemon:
             c.send(protocol.error_reply(rid, "invalid_value",
                                         "window_s/max_points out of range"))
             return
-        series = self.history.series(fields, window, max_points)
+        series = history.series(fields, window, max_points)
         c.send(protocol.reply(rid, True, data={"module": module,
                                                "window_s": window,
                                                "series": series}))
 
-    def _broadcast_panel(self) -> None:
+    def _set_visible_panel(self, name: str | None) -> None:
+        """Open `name` (closing any other panel) or close all with None."""
+        prev = self.visible_panel
+        if name == prev:
+            return
+        self.visible_panel = name
+        if prev is not None:
+            self._broadcast_panel(prev, False)
+        if name is not None:
+            self._broadcast_panel(name, True)
+        if name == "battery":
+            self._brightness_state(force=True)
+        if "battery" in (prev, name):
+            self._schedule_sample()
+
+    def _broadcast_panel(self, name: str, visible: bool) -> None:
         for c in list(self.clients):
             if "panel" in c.subscribed:
                 c.send({"v": 1, "event": "panel",
-                        "data": {"panel": "battery",
-                                 "visible": self.panel_visible}})
+                        "data": {"panel": name, "visible": visible}})
 
     # ------------------------------------------------------------- accept
     def _on_accept(self, srv, *_a) -> bool:
