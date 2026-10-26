@@ -6,7 +6,11 @@ in vitals.linux.bluez or by test fixtures.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import time
+from pathlib import Path
 
 ADAPTER = "org.bluez.Adapter1"
 DEVICE = "org.bluez.Device1"
@@ -125,6 +129,50 @@ class BluezModel:
         return out
 
 
+class LastConnected:
+    """MAC -> wall time of the last Connected false->true transition,
+    persisted as JSON (BlueZ does not expose it; SPEC 8.2.3 sorts by it)."""
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self.times: dict[str, float] = {}
+        self._connected: set[str] | None = None   # None until first update
+        if path is not None:
+            try:
+                data = json.loads(path.read_text())
+                self.times = {str(k).upper(): float(v) for k, v in data.items()
+                              if isinstance(v, (int, float))}
+            except (OSError, ValueError, AttributeError):
+                self.times = {}
+
+    def update(self, connected: set[str], now: float | None = None) -> bool:
+        """Record newly connected MACs; True (and saved) if anything changed.
+        Devices already connected at startup only get a time if unknown."""
+        now = time.time() if now is None else now
+        connected = {m.upper() for m in connected}
+        prev = self._connected
+        self._connected = connected
+        new = connected - prev if prev is not None else \
+            {m for m in connected if m not in self.times}
+        if not new:
+            return False
+        for m in new:
+            self.times[m] = now
+        self._save()
+        return True
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.times))
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+
 def device_state(dev: dict, battery: dict | None, busy: str | None = None) -> dict:
     pct = battery.get("Percentage") if battery else None
     return {
@@ -144,11 +192,13 @@ def device_state(dev: dict, battery: dict | None, busy: str | None = None) -> di
 
 
 def snapshot(model: BluezModel, available: bool, rfkill: str,
-             busy: dict[str, str] | None = None) -> dict:
+             busy: dict[str, str] | None = None,
+             last_connected: dict[str, float] | None = None) -> dict:
     """The `bluetooth` module state published by the daemon.
     Devices: paired or connected ones (discovered-only devices arrive with
     discovery support)."""
     busy = busy or {}
+    last_connected = last_connected or {}
     ad = model.adapter() if available else None
     adapter = None
     if ad is not None:
@@ -164,8 +214,12 @@ def snapshot(model: BluezModel, available: bool, rfkill: str,
     if ad is not None:
         for _p, d, b in model.devices():
             if d.get("Paired") or d.get("Connected"):
-                devices.append(device_state(
-                    d, b, busy.get(str(d.get("Address", "")).upper())))
+                mac = str(d.get("Address", "")).upper()
+                ds = device_state(d, b, busy.get(mac))
+                ts = last_connected.get(mac)
+                ds["last_connected"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else None
+                devices.append(ds)
         devices.sort(key=lambda x: (not x["connected"], (x["alias"] or "").lower()))
     return {
         "available": available,
@@ -175,6 +229,25 @@ def snapshot(model: BluezModel, available: bool, rfkill: str,
         "transfer": None,
         "prompt": None,
     }
+
+
+def sections(bt: dict) -> tuple[list[dict], list[dict]]:
+    """(connected, paired-but-not-connected) for the panel (SPEC 8.2.2-3).
+    Paired devices are most recently connected first, never-connected last,
+    then by name, so the order is stable while the panel is open."""
+    devices = (bt or {}).get("devices") or []
+    connected = [d for d in devices if d.get("connected")]
+    paired = [d for d in devices if not d.get("connected") and d.get("paired")]
+    connected.sort(key=lambda d: (d.get("alias") or "").lower())
+    paired.sort(key=lambda d: (d.get("last_connected") is None,
+                               _neg_iso(d.get("last_connected")),
+                               (d.get("alias") or "").lower()))
+    return connected, paired
+
+
+def _neg_iso(ts: str | None) -> str:
+    # ISO-8601 UTC strings sort chronologically; invert for descending order
+    return "".join(chr(0x7F - ord(c)) for c in ts) if ts else ""
 
 
 def classify(bt: dict, low_battery: int = 15) -> tuple[str, list[str]]:

@@ -21,12 +21,16 @@ class FakeView:
         self.visible = False
         self.data_calls = 0
         self.history = []
+        self.replies = []
 
     def on_data(self):
         self.data_calls += 1
 
     def on_history(self, data):
         self.history.append(data)
+
+    def on_reply(self, msg):
+        self.replies.append(msg)
 
     def show(self):
         self.visible = True
@@ -102,6 +106,17 @@ class PanelAppTests(unittest.TestCase):
         self.app.on_msg({"ok": True, "data": {"control": "power.profile",
                                               "value": "balanced"}})
         self.assertEqual((a.data_calls, b.data_calls), (0, 1))
+
+    def test_replies_offered_to_every_view(self):
+        self.app.set_visible("a", True)
+        self.app.set_visible("b", True)
+        err = {"v": 1, "id": "bt:AA:BB:CC:DD:EE:01", "ok": False,
+               "error": {"code": "unreachable", "message": "x"}}
+        self.app.on_msg(err)
+        self.assertEqual(self.app.views["a"].replies, [err])
+        self.assertEqual(self.app.views["b"].replies, [err])
+        self.app.on_msg({"v": 1, "event": "update", "data": {"other": {}}})
+        self.assertEqual(len(self.app.views["b"].replies), 1)  # events aren't replies
 
     def test_history_routed_to_owner(self):
         self.app.set_visible("a", True)

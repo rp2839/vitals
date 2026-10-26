@@ -173,6 +173,8 @@ class Daemon:
         self.bluez = BluezBackend(on_change=self._on_bt_changed)
         self.bt_rfkill = rfkill_mod.state()
         self.bt_busy: dict[str, str] = {}   # MAC -> busy label (SPEC 8.2)
+        self.bt_last = bt_mod.LastConnected(
+            config_mod.state_dir() / "bluetooth.json")
         self._bt_flush_pending = False
         self.clients: set[Client] = set()
         self.battery_state: dict = {}
@@ -208,6 +210,7 @@ class Daemon:
         self.register_module("power", self._power_data)
         self.register_module("bluetooth", self._bluetooth_data)
         self.register_panel("battery")
+        self.register_panel("bluetooth")
 
     # ------------------------------------------------------------- registry
     def register_module(self, name: str, data: Callable[[], dict],
@@ -399,6 +402,9 @@ class Daemon:
         self._dirty = True
 
     def _on_bt_changed(self) -> None:
+        if self.bluez.available:
+            self.bt_last.update({str(d.get("Address", "")) for _p, d, _b
+                                 in self.bluez.model.devices() if d.get("Connected")})
         self._dirty = True
         if not self._bt_flush_pending:
             self._bt_flush_pending = True
@@ -441,7 +447,7 @@ class Daemon:
 
     def _bluetooth_data(self) -> dict:
         return bt_mod.snapshot(self.bluez.model, self.bluez.available,
-                               self.bt_rfkill, self.bt_busy)
+                               self.bt_rfkill, self.bt_busy, self.bt_last.times)
 
     def module_data(self, modules: list[str] | None = None) -> dict:
         """State for the requested registered modules (all when None);
