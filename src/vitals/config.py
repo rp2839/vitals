@@ -47,6 +47,11 @@ def config_path() -> Path:
     return Path(base) / "vitals" / "config.toml"
 
 
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+    return Path(base) / "vitals"
+
+
 def _merge(base: dict, over: dict) -> dict:
     out = dict(base)
     for k, v in over.items():

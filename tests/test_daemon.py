@@ -1,10 +1,13 @@
 """Daemon module registry and named-panel visibility (no sockets, no D-Bus)."""
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# daemon state files (Bluetooth last-connected) must not touch ~/.local/state
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp()
 
 from vitals import config as config_mod  # noqa: E402
 
@@ -46,7 +49,7 @@ class RegistryTests(unittest.TestCase):
     def test_builtin_modules_and_panel(self):
         d = make_daemon()
         self.assertEqual(list(d.modules), ["battery", "power", "bluetooth"])
-        self.assertEqual(d.panels, {"battery"})
+        self.assertEqual(d.panels, {"battery", "bluetooth"})
         self.assertIn("battery", d.histories)
 
     def test_module_data_all_and_filtered(self):
